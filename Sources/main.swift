@@ -14,6 +14,11 @@ struct OpenAiAccountItem: Identifiable {
     let remainingPercent: Double
     let resetDate: Date?
     let resetCredits: Int
+    
+    // 是否为次要/备用或已用尽账号
+    var isSecondaryOrExhausted: Bool {
+        return !isMain || usedPercent >= 100.0
+    }
 }
 
 struct SubQuotaWindow: Identifiable {
@@ -172,7 +177,11 @@ class DataManager: ObservableObject {
                 ))
             }
         }
-        openAiItems.sort { $0.isMain && !$1.isMain }
+        // 排序规则：主账号排在最前面，其次按剩余额度从高到低
+        openAiItems.sort {
+            if $0.isMain != $1.isMain { return $0.isMain }
+            return $0.remainingPercent > $1.remainingPercent
+        }
 
         // 2. Google Antigravity
         let googleCfg = configProviders["google-antigravity"] as? [String: Any]
@@ -186,11 +195,11 @@ class DataManager: ObservableObject {
         let gemUsed: Double = 12.0
         let claUsed: Double = 35.0
         let googleSubWindows = [
-            SubQuotaWindow(label: "Gemini 3.7 / 3.1 系列", hint: "Google 自研模型池", usedPercent: gemUsed, remainingPercent: 100 - gemUsed, resetDate: nil),
-            SubQuotaWindow(label: "Claude Sonnet / Opus 系列", hint: "第三方模型池", usedPercent: claUsed, remainingPercent: 100 - claUsed, resetDate: nil)
+            SubQuotaWindow(label: "Gemini 3.7 / 3.1 系列", hint: "Google 自研模型", usedPercent: gemUsed, remainingPercent: 100 - gemUsed, resetDate: nil),
+            SubQuotaWindow(label: "Claude Sonnet / Opus 系列", hint: "第三方托管模型", usedPercent: claUsed, remainingPercent: 100 - claUsed, resetDate: nil)
         ]
 
-        // 3. Cursor (严格对齐官方 Included in Pro 结构)
+        // 3. Cursor
         let cursorCfg = configProviders["cursor"] as? [String: Any]
         let cursorAuth = authData["cursor"] as? [String: Any]
         let cursorAccounts = cursorAuth?["accounts"] as? [[String: Any]]
@@ -199,9 +208,6 @@ class DataManager: ObservableObject {
         let cursorStat = providerStats["cursor"] ?? (0, 0)
         let cursorDisabled = (cursorCfg?["disabled"] as? Bool) ?? false
 
-        // 严格遵循 Cursor 官方定义：
-        // 1. Cursor Models (Includes Cursor Grok and Composer)
-        // 2. Other Models (Claude / GPT 等第三方模型)
         let cursorModelsUsed: Double = 5.0
         let otherModelsUsed: Double = 1.0
         let cursorSubWindows = [
@@ -214,7 +220,7 @@ class DataManager: ObservableObject {
             ),
             SubQuotaWindow(
                 label: "Other Models",
-                hint: "Includes Claude, GPT & $20 API quota",
+                hint: "Claude, GPT & $20 API usage",
                 usedPercent: otherModelsUsed,
                 remainingPercent: 100 - otherModelsUsed,
                 resetDate: nil
@@ -327,12 +333,95 @@ struct QuotaProgressView: View {
     }
 }
 
-// 统一的 OpenAI 多账号聚合卡片
-struct OpenAiUnifiedCardView: View {
-    let accounts: [OpenAiAccountItem]
+// OpenAI 单个账号的条目组件
+struct OpenAiAccountRowView: View {
+    let acc: OpenAiAccountItem
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                HStack(spacing: 4) {
+                    Image(systemName: acc.isMain ? "crown.fill" : "person.fill")
+                        .foregroundColor(acc.isMain ? Color.orange : Color.blue)
+                        .font(.system(size: 10, weight: .bold))
+
+                    Text(acc.name)
+                        .font(.system(size: 11, weight: .semibold))
+                }
+
+                if let email = acc.email {
+                    Text("(" + email + ")")
+                        .font(.system(size: 9.5))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                Text(String(Int(round(acc.usedPercent))) + "% 已用")
+                    .font(.system(size: 10.5, weight: .bold))
+                    .foregroundColor(acc.usedPercent > 80 ? .red : .primary)
+                Text("(余 " + String(Int(round(acc.remainingPercent))) + "%)")
+                    .font(.system(size: 9.5))
+                    .foregroundColor(.secondary)
+            }
+
+            QuotaProgressView(percent: acc.usedPercent)
+
+            HStack {
+                if let reset = acc.resetDate {
+                    HStack(spacing: 3) {
+                        Image(systemName: "clock.arrow.circlepath")
+                        Text(formatResetTime(reset))
+                    }
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+                }
+                Spacer()
+                if acc.resetCredits > 0 {
+                    HStack(spacing: 3) {
+                        Image(systemName: "ticket.fill")
+                        Text("重置券: " + String(acc.resetCredits))
+                    }
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(.green)
+                }
+            }
+        }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.primary.opacity(0.03))
+        )
+    }
+
+    private func formatResetTime(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "M-d HH:mm 重置"
+        return formatter.string(from: date)
+    }
+}
+
+// 统一的 OpenAI 多账号聚合卡片（支持折叠/展开非在用或用尽账号）
+struct OpenAiUnifiedCardView: View {
+    let accounts: [OpenAiAccountItem]
+    @State private var isExpanded: Bool = false
+
+    // 在用活跃主账号
+    var primaryAccounts: [OpenAiAccountItem] {
+        let mains = accounts.filter { $0.isMain }
+        return mains.isEmpty ? Array(accounts.prefix(1)) : mains
+    }
+
+    // 备用/非在用/已用尽账号
+    var secondaryAccounts: [OpenAiAccountItem] {
+        let primaryIDs = Set(primaryAccounts.map { $0.id })
+        return accounts.filter { !primaryIDs.contains($0.id) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            // 头部标题栏
             HStack(alignment: .center) {
                 HStack(spacing: 6) {
                     Image(systemName: "sparkles.square.filled.on.square")
@@ -345,73 +434,59 @@ struct OpenAiUnifiedCardView: View {
 
                 Spacer()
 
-                Text("多账号轮询")
-                    .font(.system(size: 8.5, weight: .heavy))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color.orange.opacity(0.12))
-                    .foregroundColor(Color.orange)
-                    .clipShape(Capsule())
+                HStack(spacing: 4) {
+                    Text("共 " + String(accounts.count) + " 个账号")
+                        .font(.system(size: 9.5))
+                        .foregroundColor(.secondary)
+
+                    Text("多账号轮询")
+                        .font(.system(size: 8.5, weight: .heavy))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.orange.opacity(0.12))
+                        .foregroundColor(Color.orange)
+                        .clipShape(Capsule())
+                }
             }
 
-            VStack(spacing: 9) {
-                ForEach(accounts) { acc in
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            HStack(spacing: 4) {
-                                Image(systemName: acc.isMain ? "crown.fill" : "person.fill")
-                                    .foregroundColor(acc.isMain ? Color.orange : Color.blue)
-                                    .font(.system(size: 10, weight: .bold))
+            // 1. 常驻展示的主力/在用账号
+            VStack(spacing: 8) {
+                ForEach(primaryAccounts) { acc in
+                    OpenAiAccountRowView(acc: acc)
+                }
+            }
 
-                                Text(acc.name)
-                                    .font(.system(size: 11, weight: .semibold))
-                            }
-
-                            if let email = acc.email {
-                                Text("(" + email + ")")
-                                    .font(.system(size: 9.5))
-                                    .foregroundColor(.secondary)
-                                    .lineLimit(1)
-                            }
-
-                            Spacer()
-
-                            Text(String(Int(round(acc.usedPercent))) + "% 已用")
-                                .font(.system(size: 10.5, weight: .bold))
-                                .foregroundColor(acc.usedPercent > 80 ? .red : .primary)
-                            Text("(余 " + String(Int(round(acc.remainingPercent))) + "%)")
-                                .font(.system(size: 9.5))
-                                .foregroundColor(.secondary)
-                        }
-
-                        QuotaProgressView(percent: acc.usedPercent)
-
-                        HStack {
-                            if let reset = acc.resetDate {
-                                HStack(spacing: 3) {
-                                    Image(systemName: "clock.arrow.circlepath")
-                                    Text(formatResetTime(reset))
-                                }
-                                .font(.system(size: 9))
-                                .foregroundColor(.secondary)
-                            }
-                            Spacer()
-                            if acc.resetCredits > 0 {
-                                HStack(spacing: 3) {
-                                    Image(systemName: "ticket.fill")
-                                    Text("重置券: " + String(acc.resetCredits))
-                                }
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundColor(.green)
-                            }
+            // 2. 备用/已用尽账号（支持手动展开/折叠）
+            if !secondaryAccounts.isEmpty {
+                if isExpanded {
+                    VStack(spacing: 8) {
+                        ForEach(secondaryAccounts) { acc in
+                            OpenAiAccountRowView(acc: acc)
                         }
                     }
-                    .padding(8)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(Color.primary.opacity(0.03))
-                    )
+                    .transition(.opacity.combined(with: .move(edge: .top)))
                 }
+
+                // 折叠/展开切换按钮
+                Button(action: {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                        isExpanded.toggle()
+                    }
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 8.5, weight: .bold))
+
+                        Text(isExpanded ? "收起备用/已用尽账号" : ("展开其他 " + String(secondaryAccounts.count) + " 个备用账号" + (secondaryAccounts.contains(where: { $0.usedPercent >= 100 }) ? " (含用尽)" : "")))
+                            .font(.system(size: 9.5, weight: .medium))
+
+                        Spacer()
+                    }
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 4)
+                    .padding(.top, 1)
+                }
+                .buttonStyle(.plain)
             }
         }
         .padding(11)
@@ -423,12 +498,6 @@ struct OpenAiUnifiedCardView: View {
                         .stroke(Color.primary.opacity(0.06), lineWidth: 1)
                 )
         )
-    }
-
-    private func formatResetTime(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "M-d HH:mm 重置"
-        return formatter.string(from: date)
     }
 }
 
@@ -474,15 +543,12 @@ struct GoogleAntigravityCardView: View {
                         HStack {
                             Text(win.label)
                                 .font(.system(size: 10, weight: .semibold))
-                            
                             if let hint = win.hint {
                                 Text("· " + hint)
                                     .font(.system(size: 9))
                                     .foregroundColor(.secondary)
                             }
-                            
                             Spacer()
-                            
                             Text(String(Int(round(win.usedPercent))) + "% used")
                                 .font(.system(size: 10, weight: .bold))
                                 .foregroundColor(win.usedPercent > 80 ? .red : .primary)
@@ -566,28 +632,23 @@ struct CursorQuotaCardView: View {
                 .foregroundColor(.secondary)
                 .lineLimit(1)
 
-            // 严格按官方截图展示两个子池
             VStack(spacing: 7) {
                 ForEach(subWindows) { win in
                     VStack(alignment: .leading, spacing: 3) {
                         HStack {
                             Text(win.label)
                                 .font(.system(size: 10.5, weight: .semibold))
-                            
                             if let hint = win.hint {
                                 Text("· " + hint)
                                     .font(.system(size: 9))
                                     .foregroundColor(.secondary)
                                     .lineLimit(1)
                             }
-                            
                             Spacer()
-                            
                             Text(String(Int(round(win.usedPercent))) + "% used")
                                 .font(.system(size: 10.5, weight: .bold))
                                 .foregroundColor(win.usedPercent > 80 ? .red : .primary)
                         }
-                        
                         QuotaProgressView(percent: win.usedPercent)
                     }
                 }
@@ -695,7 +756,7 @@ struct PopoverContentView: View {
                                 .foregroundColor(.secondary)
                         }
 
-                        // 1. OpenAI 多账号聚合卡片
+                        // 1. OpenAI 多账号聚合卡片（默认隐藏非在用/用尽账号，可一键展开）
                         if !dm.openAiAccounts.isEmpty {
                             OpenAiUnifiedCardView(accounts: dm.openAiAccounts)
                         }

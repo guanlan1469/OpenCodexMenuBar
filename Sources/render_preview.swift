@@ -145,7 +145,10 @@ class PreviewDataManager: ObservableObject {
                 ))
             }
         }
-        openAiAccounts.sort { $0.isMain && !$1.isMain }
+        openAiAccounts.sort {
+            if $0.isMain != $1.isMain { return $0.isMain }
+            return $0.remainingPercent > $1.remainingPercent
+        }
         
         // 2. Google Antigravity
         let googleCfg = configProviders["google-antigravity"] as? [String: Any]
@@ -164,7 +167,7 @@ class PreviewDataManager: ObservableObject {
             SubQuotaWindow(label: "Claude Sonnet / Opus 系列", hint: "第三方托管模型", usedPercent: claUsed, remainingPercent: 100 - claUsed, resetDate: nil)
         ]
         
-        // 3. Cursor (对齐官方截图：Cursor Models vs Other Models)
+        // 3. Cursor
         let cursorCfg = configProviders["cursor"] as? [String: Any]
         let cursorAuth = authData["cursor"] as? [String: Any]
         let cursorAccounts = cursorAuth?["accounts"] as? [[String: Any]]
@@ -223,10 +226,82 @@ struct QuotaProgressView: View {
     }
 }
 
+struct OpenAiAccountRowView: View {
+    let acc: OpenAiAccountItem
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                HStack(spacing: 4) {
+                    Image(systemName: acc.isMain ? "crown.fill" : "person.fill")
+                        .foregroundColor(acc.isMain ? Color.orange : Color.blue)
+                        .font(.system(size: 10, weight: .bold))
+                    Text(acc.name)
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                if let email = acc.email {
+                    Text("(" + email + ")")
+                        .font(.system(size: 9.5))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                Text(String(Int(round(acc.usedPercent))) + "% 已用")
+                    .font(.system(size: 10.5, weight: .bold))
+                    .foregroundColor(acc.usedPercent > 80 ? .red : .primary)
+                Text("(余 " + String(Int(round(acc.remainingPercent))) + "%)")
+                    .font(.system(size: 9.5))
+                    .foregroundColor(.secondary)
+            }
+            QuotaProgressView(percent: acc.usedPercent)
+            HStack {
+                if let reset = acc.resetDate {
+                    HStack(spacing: 3) {
+                        Image(systemName: "clock.arrow.circlepath")
+                        Text(formatResetTime(reset))
+                    }
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+                }
+                Spacer()
+                if acc.resetCredits > 0 {
+                    HStack(spacing: 3) {
+                        Image(systemName: "ticket.fill")
+                        Text("重置券: " + String(acc.resetCredits))
+                    }
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(.green)
+                }
+            }
+        }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.primary.opacity(0.03))
+        )
+    }
+    private func formatResetTime(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "M-d HH:mm 重置"
+        return formatter.string(from: date)
+    }
+}
+
 struct OpenAiUnifiedCardView: View {
     let accounts: [OpenAiAccountItem]
+    let forceExpanded: Bool
+    
+    var primaryAccounts: [OpenAiAccountItem] {
+        let mains = accounts.filter { $0.isMain }
+        return mains.isEmpty ? Array(accounts.prefix(1)) : mains
+    }
+    
+    var secondaryAccounts: [OpenAiAccountItem] {
+        let primaryIDs = Set(primaryAccounts.map { $0.id })
+        return accounts.filter { !primaryIDs.contains($0.id) }
+    }
+    
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .center) {
                 HStack(spacing: 6) {
                     Image(systemName: "sparkles.square.filled.on.square")
@@ -236,66 +311,42 @@ struct OpenAiUnifiedCardView: View {
                         .font(.system(size: 13, weight: .bold))
                 }
                 Spacer()
-                Text("多账号轮询")
-                    .font(.system(size: 8.5, weight: .heavy))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color.orange.opacity(0.12))
-                    .foregroundColor(Color.orange)
-                    .clipShape(Capsule())
+                HStack(spacing: 4) {
+                    Text("共 " + String(accounts.count) + " 个账号")
+                        .font(.system(size: 9.5))
+                        .foregroundColor(.secondary)
+                    Text("多账号轮询")
+                        .font(.system(size: 8.5, weight: .heavy))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.orange.opacity(0.12))
+                        .foregroundColor(Color.orange)
+                        .clipShape(Capsule())
+                }
             }
-            VStack(spacing: 9) {
-                ForEach(accounts) { acc in
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            HStack(spacing: 4) {
-                                Image(systemName: acc.isMain ? "crown.fill" : "person.fill")
-                                    .foregroundColor(acc.isMain ? Color.orange : Color.blue)
-                                    .font(.system(size: 10, weight: .bold))
-                                Text(acc.name)
-                                    .font(.system(size: 11, weight: .semibold))
-                            }
-                            if let email = acc.email {
-                                Text("(" + email + ")")
-                                    .font(.system(size: 9.5))
-                                    .foregroundColor(.secondary)
-                                    .lineLimit(1)
-                            }
-                            Spacer()
-                            Text(String(Int(round(acc.usedPercent))) + "% 已用")
-                                .font(.system(size: 10.5, weight: .bold))
-                                .foregroundColor(acc.usedPercent > 80 ? .red : .primary)
-                            Text("(余 " + String(Int(round(acc.remainingPercent))) + "%)")
-                                .font(.system(size: 9.5))
-                                .foregroundColor(.secondary)
-                        }
-                        QuotaProgressView(percent: acc.usedPercent)
-                        HStack {
-                            if let reset = acc.resetDate {
-                                HStack(spacing: 3) {
-                                    Image(systemName: "clock.arrow.circlepath")
-                                    Text(formatResetTime(reset))
-                                }
-                                .font(.system(size: 9))
-                                .foregroundColor(.secondary)
-                            }
-                            Spacer()
-                            if acc.resetCredits > 0 {
-                                HStack(spacing: 3) {
-                                    Image(systemName: "ticket.fill")
-                                    Text("重置券: " + String(acc.resetCredits))
-                                }
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundColor(.green)
-                            }
+            VStack(spacing: 8) {
+                ForEach(primaryAccounts) { acc in
+                    OpenAiAccountRowView(acc: acc)
+                }
+            }
+            if !secondaryAccounts.isEmpty {
+                if forceExpanded {
+                    VStack(spacing: 8) {
+                        ForEach(secondaryAccounts) { acc in
+                            OpenAiAccountRowView(acc: acc)
                         }
                     }
-                    .padding(8)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(Color.primary.opacity(0.03))
-                    )
                 }
+                HStack(spacing: 4) {
+                    Image(systemName: forceExpanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 8.5, weight: .bold))
+                    Text(forceExpanded ? "收起备用/已用尽账号" : ("展开其他 " + String(secondaryAccounts.count) + " 个备用账号 (含已用尽)"))
+                        .font(.system(size: 9.5, weight: .medium))
+                    Spacer()
+                }
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 4)
+                .padding(.top, 1)
             }
         }
         .padding(11)
@@ -307,11 +358,6 @@ struct OpenAiUnifiedCardView: View {
                         .stroke(Color.primary.opacity(0.06), lineWidth: 1)
                 )
         )
-    }
-    private func formatResetTime(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "M-d HH:mm 重置"
-        return formatter.string(from: date)
     }
 }
 
@@ -490,6 +536,8 @@ struct CursorQuotaCardView: View {
 
 struct PopoverContentView: View {
     @ObservedObject var dm: PreviewDataManager
+    let forceExpanded: Bool
+    
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
@@ -540,7 +588,7 @@ struct PopoverContentView: View {
                     }
                     
                     if !dm.openAiAccounts.isEmpty {
-                        OpenAiUnifiedCardView(accounts: dm.openAiAccounts)
+                        OpenAiUnifiedCardView(accounts: dm.openAiAccounts, forceExpanded: forceExpanded)
                     }
                     
                     GoogleAntigravityCardView(
@@ -643,16 +691,17 @@ struct PopoverContentView: View {
     }
 }
 
+// 渲染默认折叠状态 (精简清爽)
 let dm = PreviewDataManager()
-let view = PopoverContentView(dm: dm)
-let controller = NSHostingController(rootView: view)
-let targetSize = NSSize(width: 372, height: 710)
-controller.view.frame = NSRect(origin: .zero, size: targetSize)
+let viewCollapsed = PopoverContentView(dm: dm, forceExpanded: false)
+let controllerCollapsed = NSHostingController(rootView: viewCollapsed)
+let targetSize = NSSize(width: 372, height: 650)
+controllerCollapsed.view.frame = NSRect(origin: .zero, size: targetSize)
 
-guard let rep = controller.view.bitmapImageRepForCachingDisplay(in: controller.view.bounds) else {
+guard let rep = controllerCollapsed.view.bitmapImageRepForCachingDisplay(in: controllerCollapsed.view.bounds) else {
     exit(1)
 }
-controller.view.cacheDisplay(in: controller.view.bounds, to: rep)
+controllerCollapsed.view.cacheDisplay(in: controllerCollapsed.view.bounds, to: rep)
 
 guard let pngData = rep.representation(using: .png, properties: [:]) else {
     exit(1)
@@ -660,3 +709,4 @@ guard let pngData = rep.representation(using: .png, properties: [:]) else {
 
 let outputPath = URL(fileURLWithPath: "opencodex_menubar_preview.png")
 try! pngData.write(to: outputPath)
+print("Collapsed preview written to opencodex_menubar_preview.png")
