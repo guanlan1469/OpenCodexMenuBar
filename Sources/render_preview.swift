@@ -37,12 +37,14 @@ class PreviewDataManager: ObservableObject {
     @Published var googleSubWindows: [SubQuotaWindow] = []
     @Published var googleEmail: String = "Google CloudCode"
     @Published var googleDisabled: Bool = false
+    @Published var googleResetText: String = "滑动窗口实时恢复"
     @Published var googleCalls24h: Int = 0
     @Published var googleTokens24h: Int = 0
     
     @Published var cursorSubWindows: [SubQuotaWindow] = []
     @Published var cursorUser: String = "Cursor Pro"
     @Published var cursorDisabled: Bool = false
+    @Published var cursorResetText: String = "9-14 20:12 月度重置"
     @Published var cursorCalls24h: Int = 0
     @Published var cursorTokens24h: Int = 0
     
@@ -281,14 +283,13 @@ struct OpenAiAccountRowView: View {
     }
     private func formatResetTime(_ date: Date) -> String {
         let formatter = DateFormatter()
-        formatter.dateFormat = "M-d HH:mm 重置"
+        formatter.dateFormat = "M-d HH:mm 周重置"
         return formatter.string(from: date)
     }
 }
 
 struct OpenAiUnifiedCardView: View {
     let accounts: [OpenAiAccountItem]
-    let forceExpanded: Bool
     
     var primaryAccounts: [OpenAiAccountItem] {
         let mains = accounts.filter { $0.isMain }
@@ -330,17 +331,10 @@ struct OpenAiUnifiedCardView: View {
                 }
             }
             if !secondaryAccounts.isEmpty {
-                if forceExpanded {
-                    VStack(spacing: 8) {
-                        ForEach(secondaryAccounts) { acc in
-                            OpenAiAccountRowView(acc: acc)
-                        }
-                    }
-                }
                 HStack(spacing: 4) {
-                    Image(systemName: forceExpanded ? "chevron.up" : "chevron.down")
+                    Image(systemName: "chevron.down")
                         .font(.system(size: 8.5, weight: .bold))
-                    Text(forceExpanded ? "收起备用/已用尽账号" : ("展开其他 " + String(secondaryAccounts.count) + " 个备用账号 (含已用尽)"))
+                    Text("展开其他 " + String(secondaryAccounts.count) + " 个备用账号 (含已用尽)")
                         .font(.system(size: 9.5, weight: .medium))
                     Spacer()
                 }
@@ -365,6 +359,7 @@ struct GoogleAntigravityCardView: View {
     let email: String
     let disabled: Bool
     let subWindows: [SubQuotaWindow]
+    let resetText: String
     let calls24h: Int
     let tokens24h: Int
     var body: some View {
@@ -412,12 +407,12 @@ struct GoogleAntigravityCardView: View {
             }
             .padding(.top, 1)
             HStack {
-                HStack(spacing: 4) {
-                    Circle().fill(Color.green).frame(width: 5, height: 5)
-                    Text("通道活跃 · 自动调度")
-                        .font(.system(size: 9.5))
-                        .foregroundColor(.secondary)
+                HStack(spacing: 3) {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                    Text(resetText)
                 }
+                .font(.system(size: 9))
+                .foregroundColor(.secondary)
                 Spacer()
                 if calls24h > 0 {
                     Text("24h: " + String(calls24h) + "次 · " + formatTokens(tokens24h))
@@ -451,6 +446,7 @@ struct CursorQuotaCardView: View {
     let user: String
     let disabled: Bool
     let subWindows: [SubQuotaWindow]
+    let resetText: String
     let calls24h: Int
     let tokens24h: Int
     var body: some View {
@@ -499,12 +495,12 @@ struct CursorQuotaCardView: View {
             }
             .padding(.top, 1)
             HStack {
-                HStack(spacing: 4) {
-                    Circle().fill(Color.green).frame(width: 5, height: 5)
-                    Text("OAuth 授权正常 · 额度充裕")
-                        .font(.system(size: 9.5))
-                        .foregroundColor(.secondary)
+                HStack(spacing: 3) {
+                    Image(systemName: "clock.arrow.circlepath")
+                    Text(resetText)
                 }
+                .font(.system(size: 9))
+                .foregroundColor(.secondary)
                 Spacer()
                 if calls24h > 0 {
                     Text("24h: " + String(calls24h) + "次 · " + formatTokens(tokens24h))
@@ -536,7 +532,6 @@ struct CursorQuotaCardView: View {
 
 struct PopoverContentView: View {
     @ObservedObject var dm: PreviewDataManager
-    let forceExpanded: Bool
     
     var body: some View {
         VStack(spacing: 0) {
@@ -588,13 +583,14 @@ struct PopoverContentView: View {
                     }
                     
                     if !dm.openAiAccounts.isEmpty {
-                        OpenAiUnifiedCardView(accounts: dm.openAiAccounts, forceExpanded: forceExpanded)
+                        OpenAiUnifiedCardView(accounts: dm.openAiAccounts)
                     }
                     
                     GoogleAntigravityCardView(
                         email: dm.googleEmail,
                         disabled: dm.googleDisabled,
                         subWindows: dm.googleSubWindows,
+                        resetText: dm.googleResetText,
                         calls24h: dm.googleCalls24h,
                         tokens24h: dm.googleTokens24h
                     )
@@ -603,6 +599,7 @@ struct PopoverContentView: View {
                         user: dm.cursorUser,
                         disabled: dm.cursorDisabled,
                         subWindows: dm.cursorSubWindows,
+                        resetText: dm.cursorResetText,
                         calls24h: dm.cursorCalls24h,
                         tokens24h: dm.cursorTokens24h
                     )
@@ -691,17 +688,16 @@ struct PopoverContentView: View {
     }
 }
 
-// 渲染默认折叠状态 (精简清爽)
 let dm = PreviewDataManager()
-let viewCollapsed = PopoverContentView(dm: dm, forceExpanded: false)
-let controllerCollapsed = NSHostingController(rootView: viewCollapsed)
-let targetSize = NSSize(width: 372, height: 650)
-controllerCollapsed.view.frame = NSRect(origin: .zero, size: targetSize)
+let view = PopoverContentView(dm: dm)
+let controller = NSHostingController(rootView: view)
+let targetSize = NSSize(width: 372, height: 660)
+controller.view.frame = NSRect(origin: .zero, size: targetSize)
 
-guard let rep = controllerCollapsed.view.bitmapImageRepForCachingDisplay(in: controllerCollapsed.view.bounds) else {
+guard let rep = controller.view.bitmapImageRepForCachingDisplay(in: controller.view.bounds) else {
     exit(1)
 }
-controllerCollapsed.view.cacheDisplay(in: controllerCollapsed.view.bounds, to: rep)
+controller.view.cacheDisplay(in: controller.view.bounds, to: rep)
 
 guard let pngData = rep.representation(using: .png, properties: [:]) else {
     exit(1)
@@ -709,4 +705,3 @@ guard let pngData = rep.representation(using: .png, properties: [:]) else {
 
 let outputPath = URL(fileURLWithPath: "opencodex_menubar_preview.png")
 try! pngData.write(to: outputPath)
-print("Collapsed preview written to opencodex_menubar_preview.png")

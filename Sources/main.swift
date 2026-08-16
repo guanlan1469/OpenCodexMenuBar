@@ -14,11 +14,6 @@ struct OpenAiAccountItem: Identifiable {
     let remainingPercent: Double
     let resetDate: Date?
     let resetCredits: Int
-    
-    // 是否为次要/备用或已用尽账号
-    var isSecondaryOrExhausted: Bool {
-        return !isMain || usedPercent >= 100.0
-    }
 }
 
 struct SubQuotaWindow: Identifiable {
@@ -35,12 +30,15 @@ struct ProviderSectionData {
     let googleSubWindows: [SubQuotaWindow]
     let googleEmail: String
     let googleDisabled: Bool
+    let googleResetText: String
     let googleCalls24h: Int
     let googleTokens24h: Int
     
     let cursorSubWindows: [SubQuotaWindow]
     let cursorUser: String
     let cursorDisabled: Bool
+    let cursorResetDate: Date?
+    let cursorResetText: String
     let cursorCalls24h: Int
     let cursorTokens24h: Int
 }
@@ -61,12 +59,15 @@ class DataManager: ObservableObject {
     @Published var googleSubWindows: [SubQuotaWindow] = []
     @Published var googleEmail: String = "Google CloudCode"
     @Published var googleDisabled: Bool = false
+    @Published var googleResetText: String = "滑动窗口实时恢复"
     @Published var googleCalls24h: Int = 0
     @Published var googleTokens24h: Int = 0
     
     @Published var cursorSubWindows: [SubQuotaWindow] = []
     @Published var cursorUser: String = "Cursor Pro"
     @Published var cursorDisabled: Bool = false
+    @Published var cursorResetDate: Date? = nil
+    @Published var cursorResetText: String = "9-14 20:12 月度重置"
     @Published var cursorCalls24h: Int = 0
     @Published var cursorTokens24h: Int = 0
     
@@ -96,12 +97,15 @@ class DataManager: ObservableObject {
                 self.googleSubWindows = sectionData.googleSubWindows
                 self.googleEmail = sectionData.googleEmail
                 self.googleDisabled = sectionData.googleDisabled
+                self.googleResetText = sectionData.googleResetText
                 self.googleCalls24h = sectionData.googleCalls24h
                 self.googleTokens24h = sectionData.googleTokens24h
                 
                 self.cursorSubWindows = sectionData.cursorSubWindows
                 self.cursorUser = sectionData.cursorUser
                 self.cursorDisabled = sectionData.cursorDisabled
+                self.cursorResetDate = sectionData.cursorResetDate
+                self.cursorResetText = sectionData.cursorResetText
                 self.cursorCalls24h = sectionData.cursorCalls24h
                 self.cursorTokens24h = sectionData.cursorTokens24h
                 
@@ -177,13 +181,12 @@ class DataManager: ObservableObject {
                 ))
             }
         }
-        // 排序规则：主账号排在最前面，其次按剩余额度从高到低
         openAiItems.sort {
             if $0.isMain != $1.isMain { return $0.isMain }
             return $0.remainingPercent > $1.remainingPercent
         }
 
-        // 2. Google Antigravity
+        // 2. Google Antigravity (动态滑动窗口重置机制)
         let googleCfg = configProviders["google-antigravity"] as? [String: Any]
         let googleAuth = authData["google-antigravity"] as? [String: Any]
         let googleAccounts = googleAuth?["accounts"] as? [[String: Any]]
@@ -199,7 +202,7 @@ class DataManager: ObservableObject {
             SubQuotaWindow(label: "Claude Sonnet / Opus 系列", hint: "第三方托管模型", usedPercent: claUsed, remainingPercent: 100 - claUsed, resetDate: nil)
         ]
 
-        // 3. Cursor
+        // 3. Cursor (月度周期重置 Billing Cycle)
         let cursorCfg = configProviders["cursor"] as? [String: Any]
         let cursorAuth = authData["cursor"] as? [String: Any]
         let cursorAccounts = cursorAuth?["accounts"] as? [[String: Any]]
@@ -207,6 +210,12 @@ class DataManager: ObservableObject {
         let cursorUser = (cursorCred?["accountId"] as? String)?.components(separatedBy: "|").last ?? "Cursor Pro"
         let cursorStat = providerStats["cursor"] ?? (0, 0)
         let cursorDisabled = (cursorCfg?["disabled"] as? Bool) ?? false
+        
+        let cursorAddedAt = (cursorAccounts?.first?["addedAt"] as? Double) ?? Date().timeIntervalSince1970 * 1000.0
+        let cursorResetDate = Date(timeIntervalSince1970: (cursorAddedAt > 1e11 ? cursorAddedAt / 1000.0 : cursorAddedAt) + 30 * 24 * 3600.0)
+        let formatter = DateFormatter()
+        formatter.dateFormat = "M-d HH:mm 月度重置"
+        let cursorResetText = formatter.string(from: cursorResetDate)
 
         let cursorModelsUsed: Double = 5.0
         let otherModelsUsed: Double = 1.0
@@ -232,11 +241,14 @@ class DataManager: ObservableObject {
             googleSubWindows: googleSubWindows,
             googleEmail: googleEmail,
             googleDisabled: googleDisabled,
+            googleResetText: "滑动窗口实时恢复",
             googleCalls24h: googleStat.calls,
             googleTokens24h: googleStat.tokens,
             cursorSubWindows: cursorSubWindows,
             cursorUser: cursorUser,
             cursorDisabled: cursorDisabled,
+            cursorResetDate: cursorResetDate,
+            cursorResetText: cursorResetText,
             cursorCalls24h: cursorStat.calls,
             cursorTokens24h: cursorStat.tokens
         )
@@ -333,7 +345,6 @@ struct QuotaProgressView: View {
     }
 }
 
-// OpenAI 单个账号的条目组件
 struct OpenAiAccountRowView: View {
     let acc: OpenAiAccountItem
 
@@ -397,23 +408,21 @@ struct OpenAiAccountRowView: View {
 
     private func formatResetTime(_ date: Date) -> String {
         let formatter = DateFormatter()
-        formatter.dateFormat = "M-d HH:mm 重置"
+        formatter.dateFormat = "M-d HH:mm 周重置"
         return formatter.string(from: date)
     }
 }
 
-// 统一的 OpenAI 多账号聚合卡片（支持折叠/展开非在用或用尽账号）
+// 统一的 OpenAI 多账号聚合卡片
 struct OpenAiUnifiedCardView: View {
     let accounts: [OpenAiAccountItem]
     @State private var isExpanded: Bool = false
 
-    // 在用活跃主账号
     var primaryAccounts: [OpenAiAccountItem] {
         let mains = accounts.filter { $0.isMain }
         return mains.isEmpty ? Array(accounts.prefix(1)) : mains
     }
 
-    // 备用/非在用/已用尽账号
     var secondaryAccounts: [OpenAiAccountItem] {
         let primaryIDs = Set(primaryAccounts.map { $0.id })
         return accounts.filter { !primaryIDs.contains($0.id) }
@@ -421,7 +430,6 @@ struct OpenAiUnifiedCardView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
-            // 头部标题栏
             HStack(alignment: .center) {
                 HStack(spacing: 6) {
                     Image(systemName: "sparkles.square.filled.on.square")
@@ -449,14 +457,12 @@ struct OpenAiUnifiedCardView: View {
                 }
             }
 
-            // 1. 常驻展示的主力/在用账号
             VStack(spacing: 8) {
                 ForEach(primaryAccounts) { acc in
                     OpenAiAccountRowView(acc: acc)
                 }
             }
 
-            // 2. 备用/已用尽账号（支持手动展开/折叠）
             if !secondaryAccounts.isEmpty {
                 if isExpanded {
                     VStack(spacing: 8) {
@@ -467,7 +473,6 @@ struct OpenAiUnifiedCardView: View {
                     .transition(.opacity.combined(with: .move(edge: .top)))
                 }
 
-                // 折叠/展开切换按钮
                 Button(action: {
                     withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                         isExpanded.toggle()
@@ -501,11 +506,12 @@ struct OpenAiUnifiedCardView: View {
     }
 }
 
-// Google 资源池卡片
+// Google 资源池卡片（带重置与恢复周期）
 struct GoogleAntigravityCardView: View {
     let email: String
     let disabled: Bool
     let subWindows: [SubQuotaWindow]
+    let resetText: String
     let calls24h: Int
     let tokens24h: Int
 
@@ -560,13 +566,15 @@ struct GoogleAntigravityCardView: View {
             .padding(.top, 1)
 
             HStack {
-                HStack(spacing: 4) {
-                    Circle().fill(Color.green).frame(width: 5, height: 5)
-                    Text("通道活跃 · 自动调度")
-                        .font(.system(size: 9.5))
-                        .foregroundColor(.secondary)
+                HStack(spacing: 3) {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                    Text(resetText)
                 }
+                .font(.system(size: 9))
+                .foregroundColor(.secondary)
+
                 Spacer()
+
                 if calls24h > 0 {
                     Text("24h: " + String(calls24h) + "次 · " + formatTokens(tokens24h))
                         .font(.system(size: 9.5, weight: .semibold))
@@ -596,11 +604,12 @@ struct GoogleAntigravityCardView: View {
     }
 }
 
-// Cursor 资源池卡片（严格对齐官方 Included in Pro 结构）
+// Cursor 资源池卡片（带月度账单周期重置时间）
 struct CursorQuotaCardView: View {
     let user: String
     let disabled: Bool
     let subWindows: [SubQuotaWindow]
+    let resetText: String
     let calls24h: Int
     let tokens24h: Int
 
@@ -656,13 +665,15 @@ struct CursorQuotaCardView: View {
             .padding(.top, 1)
 
             HStack {
-                HStack(spacing: 4) {
-                    Circle().fill(Color.green).frame(width: 5, height: 5)
-                    Text("OAuth 授权正常 · 额度充裕")
-                        .font(.system(size: 9.5))
-                        .foregroundColor(.secondary)
+                HStack(spacing: 3) {
+                    Image(systemName: "clock.arrow.circlepath")
+                    Text(resetText)
                 }
+                .font(.system(size: 9))
+                .foregroundColor(.secondary)
+
                 Spacer()
+
                 if calls24h > 0 {
                     Text("24h: " + String(calls24h) + "次 · " + formatTokens(tokens24h))
                         .font(.system(size: 9.5, weight: .semibold))
@@ -697,7 +708,6 @@ struct PopoverContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Header
             HStack(spacing: 10) {
                 ZStack {
                     Circle()
@@ -744,7 +754,6 @@ struct PopoverContentView: View {
 
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 13) {
-                    // Section 1: 三大通道卡片
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
                             Text("核心模型通道配额")
@@ -756,31 +765,32 @@ struct PopoverContentView: View {
                                 .foregroundColor(.secondary)
                         }
 
-                        // 1. OpenAI 多账号聚合卡片（默认隐藏非在用/用尽账号，可一键展开）
+                        // 1. OpenAI 多账号卡片 (周重置)
                         if !dm.openAiAccounts.isEmpty {
                             OpenAiUnifiedCardView(accounts: dm.openAiAccounts)
                         }
 
-                        // 2. Google Antigravity 卡片
+                        // 2. Google Antigravity 卡片 (滑动窗口恢复)
                         GoogleAntigravityCardView(
                             email: dm.googleEmail,
                             disabled: dm.googleDisabled,
                             subWindows: dm.googleSubWindows,
+                            resetText: dm.googleResetText,
                             calls24h: dm.googleCalls24h,
                             tokens24h: dm.googleTokens24h
                         )
 
-                        // 3. Cursor 官方规范卡片
+                        // 3. Cursor 官方规范卡片 (月度账单周期重置)
                         CursorQuotaCardView(
                             user: dm.cursorUser,
                             disabled: dm.cursorDisabled,
                             subWindows: dm.cursorSubWindows,
+                            resetText: dm.cursorResetText,
                             calls24h: dm.cursorCalls24h,
                             tokens24h: dm.cursorTokens24h
                         )
                     }
 
-                    // Section 2: 24 小时各模型消耗分析
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Text("24小时模型消耗分析")
