@@ -1,4 +1,5 @@
 import Cocoa
+import os
 import SwiftUI
 
 // MARK: - Models
@@ -25,12 +26,32 @@ struct SubQuotaWindow: Identifiable {
     let resetDate: Date?
 }
 
+struct CursorQuotaSnapshot {
+    let subWindows: [SubQuotaWindow]
+    let monthlyUsedPercent: Double?
+    let resetDate: Date?
+    let updatedAt: Date?
+    let experimental: Bool
+}
+
+struct GoogleQuotaSnapshot {
+    let subWindows: [SubQuotaWindow]
+    let resetDate: Date?
+    let updatedAt: Date?
+}
+
+struct ProviderQuotaSnapshots {
+    let google: GoogleQuotaSnapshot?
+    let cursor: CursorQuotaSnapshot?
+}
+
 struct ProviderSectionData {
     let openAiAccounts: [OpenAiAccountItem]
     let googleSubWindows: [SubQuotaWindow]
     let googleEmail: String
     let googleDisabled: Bool
     let googleResetText: String
+    let googleQuotaStatusText: String
     let googleCalls24h: Int
     let googleTokens24h: Int
     
@@ -39,6 +60,8 @@ struct ProviderSectionData {
     let cursorDisabled: Bool
     let cursorResetDate: Date?
     let cursorResetText: String
+    let cursorQuotaStatusText: String
+    let cursorQuotaExperimental: Bool
     let cursorCalls24h: Int
     let cursorTokens24h: Int
 }
@@ -59,7 +82,8 @@ class DataManager: ObservableObject {
     @Published var googleSubWindows: [SubQuotaWindow] = []
     @Published var googleEmail: String = "Google CloudCode"
     @Published var googleDisabled: Bool = false
-    @Published var googleResetText: String = "滑动窗口实时恢复"
+    @Published var googleResetText: String = "恢复时间未知"
+    @Published var googleQuotaStatusText: String = "额度暂不可用"
     @Published var googleCalls24h: Int = 0
     @Published var googleTokens24h: Int = 0
     
@@ -67,7 +91,9 @@ class DataManager: ObservableObject {
     @Published var cursorUser: String = "Cursor Pro"
     @Published var cursorDisabled: Bool = false
     @Published var cursorResetDate: Date? = nil
-    @Published var cursorResetText: String = "9-14 20:12 月度重置"
+    @Published var cursorResetText: String = "重置时间未知"
+    @Published var cursorQuotaStatusText: String = "额度暂不可用"
+    @Published var cursorQuotaExperimental: Bool = true
     @Published var cursorCalls24h: Int = 0
     @Published var cursorTokens24h: Int = 0
     
@@ -78,6 +104,11 @@ class DataManager: ObservableObject {
     @Published var summaryTitle: String = "⚡️ ..."
 
     private var timer: Timer?
+    private let refreshQueue = DispatchQueue(label: "com.zhoujie.opencodex.menubar.refresh", qos: .utility)
+    private let logger = Logger(subsystem: "com.zhoujie.opencodex.menubar", category: "quota")
+    private var cachedProviderQuotas: ProviderQuotaSnapshots?
+    private var lastProviderQuotaFetchAttempt = Date.distantPast
+    private let providerQuotaRefreshInterval: TimeInterval = 60
 
     init() {
         refreshData()
@@ -86,11 +117,12 @@ class DataManager: ObservableObject {
         }
     }
 
-    func refreshData() {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+    func refreshData(forceProviderQuotaRefresh: Bool = false) {
+        refreshQueue.async { [weak self] in
             guard let self = self else { return }
             let (models, calls, tokens, providerStats) = self.loadUsageStats()
-            let sectionData = self.loadSectionData(providerStats: providerStats)
+            let providerQuotas = self.loadProviderQuotasIfNeeded(forceRefresh: forceProviderQuotaRefresh)
+            let sectionData = self.loadSectionData(providerStats: providerStats, providerQuotas: providerQuotas)
 
             DispatchQueue.main.async {
                 self.openAiAccounts = sectionData.openAiAccounts
@@ -98,6 +130,7 @@ class DataManager: ObservableObject {
                 self.googleEmail = sectionData.googleEmail
                 self.googleDisabled = sectionData.googleDisabled
                 self.googleResetText = sectionData.googleResetText
+                self.googleQuotaStatusText = sectionData.googleQuotaStatusText
                 self.googleCalls24h = sectionData.googleCalls24h
                 self.googleTokens24h = sectionData.googleTokens24h
                 
@@ -106,6 +139,8 @@ class DataManager: ObservableObject {
                 self.cursorDisabled = sectionData.cursorDisabled
                 self.cursorResetDate = sectionData.cursorResetDate
                 self.cursorResetText = sectionData.cursorResetText
+                self.cursorQuotaStatusText = sectionData.cursorQuotaStatusText
+                self.cursorQuotaExperimental = sectionData.cursorQuotaExperimental
                 self.cursorCalls24h = sectionData.cursorCalls24h
                 self.cursorTokens24h = sectionData.cursorTokens24h
                 
@@ -124,7 +159,10 @@ class DataManager: ObservableObject {
         }
     }
 
-    private func loadSectionData(providerStats: [String: (calls: Int, tokens: Int)]) -> ProviderSectionData {
+    private func loadSectionData(
+        providerStats: [String: (calls: Int, tokens: Int)],
+        providerQuotas: ProviderQuotaSnapshots?
+    ) -> ProviderSectionData {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let quotaCacheURL = home.appendingPathComponent(".opencodex/codex-quota-cache.json")
         let configURL = home.appendingPathComponent(".opencodex/config.json")
@@ -186,7 +224,7 @@ class DataManager: ObservableObject {
             return $0.remainingPercent > $1.remainingPercent
         }
 
-        // 2. Google Antigravity (动态滑动窗口重置机制)
+        // 2. Google Antigravity：额度由 OpenCodeX 的 provider quota 报告提供。
         let googleCfg = configProviders["google-antigravity"] as? [String: Any]
         let googleAuth = authData["google-antigravity"] as? [String: Any]
         let googleAccounts = googleAuth?["accounts"] as? [[String: Any]]
@@ -195,14 +233,18 @@ class DataManager: ObservableObject {
         let googleStat = providerStats["google-antigravity"] ?? (0, 0)
         let googleDisabled = (googleCfg?["disabled"] as? Bool) ?? false
 
-        let gemUsed: Double = 12.0
-        let claUsed: Double = 35.0
-        let googleSubWindows = [
-            SubQuotaWindow(label: "Gemini 3.7 / 3.1 系列", hint: "Google 自研模型", usedPercent: gemUsed, remainingPercent: 100 - gemUsed, resetDate: nil),
-            SubQuotaWindow(label: "Claude Sonnet / Opus 系列", hint: "第三方托管模型", usedPercent: claUsed, remainingPercent: 100 - claUsed, resetDate: nil)
-        ]
+        let googleQuota = providerQuotas?.google
+        let googleSubWindows = googleQuota?.subWindows ?? []
+        let googleResetFormatter = DateFormatter()
+        googleResetFormatter.dateFormat = "M-d HH:mm 最近恢复"
+        let googleResetText = googleQuota?.resetDate.map(googleResetFormatter.string(from:)) ?? "恢复时间未知"
+        let quotaStatusFormatter = DateFormatter()
+        quotaStatusFormatter.dateFormat = "HH:mm"
+        let googleQuotaStatusText = googleQuota?.updatedAt
+            .map { "实时 · 更新 " + quotaStatusFormatter.string(from: $0) }
+            ?? (googleQuota == nil ? "额度暂不可用" : "实时 · 更新时间未知")
 
-        // 3. Cursor (月度周期重置 Billing Cycle)
+        // 3. Cursor：额度由 OpenCodeX 的 provider quota 报告提供。
         let cursorCfg = configProviders["cursor"] as? [String: Any]
         let cursorAuth = authData["cursor"] as? [String: Any]
         let cursorAccounts = cursorAuth?["accounts"] as? [[String: Any]]
@@ -210,38 +252,35 @@ class DataManager: ObservableObject {
         let cursorUser = (cursorCred?["accountId"] as? String)?.components(separatedBy: "|").last ?? "Cursor Pro"
         let cursorStat = providerStats["cursor"] ?? (0, 0)
         let cursorDisabled = (cursorCfg?["disabled"] as? Bool) ?? false
-        
-        let cursorAddedAt = (cursorAccounts?.first?["addedAt"] as? Double) ?? Date().timeIntervalSince1970 * 1000.0
-        let cursorResetDate = Date(timeIntervalSince1970: (cursorAddedAt > 1e11 ? cursorAddedAt / 1000.0 : cursorAddedAt) + 30 * 24 * 3600.0)
-        let formatter = DateFormatter()
-        formatter.dateFormat = "M-d HH:mm 月度重置"
-        let cursorResetText = formatter.string(from: cursorResetDate)
 
-        let cursorModelsUsed: Double = 5.0
-        let otherModelsUsed: Double = 1.0
-        let cursorSubWindows = [
-            SubQuotaWindow(
-                label: "Cursor Models",
-                hint: "Includes Cursor Grok and Composer",
-                usedPercent: cursorModelsUsed,
-                remainingPercent: 100 - cursorModelsUsed,
-                resetDate: nil
-            ),
-            SubQuotaWindow(
-                label: "Other Models",
-                hint: "Claude, GPT & $20 API usage",
-                usedPercent: otherModelsUsed,
-                remainingPercent: 100 - otherModelsUsed,
-                resetDate: nil
-            )
-        ]
+        let cursorQuota = providerQuotas?.cursor
+        let cursorResetDate = cursorQuota?.resetDate
+        let resetFormatter = DateFormatter()
+        resetFormatter.dateFormat = "M-d HH:mm 月度重置"
+        let cursorResetText = cursorResetDate.map(resetFormatter.string(from:)) ?? "重置时间未知"
+
+        let cursorQuotaStatusText: String
+        if let quota = cursorQuota {
+            let prefix = quota.experimental ? "实验性" : "实时"
+            let updated = quota.updatedAt.map { quotaStatusFormatter.string(from: $0) } ?? "未知"
+            if let monthly = quota.monthlyUsedPercent {
+                cursorQuotaStatusText = String(format: "%@ · 综合已用 %.1f%% · 更新 %@", prefix, monthly, updated)
+            } else {
+                cursorQuotaStatusText = "\(prefix) · 更新 \(updated)"
+            }
+        } else {
+            cursorQuotaStatusText = "额度暂不可用"
+        }
+
+        let cursorSubWindows = cursorQuota?.subWindows ?? []
 
         return ProviderSectionData(
             openAiAccounts: openAiItems,
             googleSubWindows: googleSubWindows,
             googleEmail: googleEmail,
             googleDisabled: googleDisabled,
-            googleResetText: "滑动窗口实时恢复",
+            googleResetText: googleResetText,
+            googleQuotaStatusText: googleQuotaStatusText,
             googleCalls24h: googleStat.calls,
             googleTokens24h: googleStat.tokens,
             cursorSubWindows: cursorSubWindows,
@@ -249,9 +288,222 @@ class DataManager: ObservableObject {
             cursorDisabled: cursorDisabled,
             cursorResetDate: cursorResetDate,
             cursorResetText: cursorResetText,
+            cursorQuotaStatusText: cursorQuotaStatusText,
+            cursorQuotaExperimental: cursorQuota?.experimental ?? true,
             cursorCalls24h: cursorStat.calls,
             cursorTokens24h: cursorStat.tokens
         )
+    }
+
+    private func loadProviderQuotasIfNeeded(forceRefresh: Bool) -> ProviderQuotaSnapshots? {
+        let now = Date()
+        if !forceRefresh,
+           let cached = cachedProviderQuotas,
+           now.timeIntervalSince(lastProviderQuotaFetchAttempt) < providerQuotaRefreshInterval {
+            return cached
+        }
+
+        lastProviderQuotaFetchAttempt = now
+        guard let data = runOpenCodexQuotaCommand(forceRefresh: forceRefresh),
+              let parsed = parseProviderQuotaSnapshots(data: data) else {
+            logger.error("Provider quota refresh failed; retaining the last valid snapshots")
+            return cachedProviderQuotas
+        }
+
+        let snapshot = ProviderQuotaSnapshots(
+            google: parsed.google ?? cachedProviderQuotas?.google,
+            cursor: parsed.cursor ?? cachedProviderQuotas?.cursor
+        )
+        cachedProviderQuotas = snapshot
+        if let google = snapshot.google {
+            let summary = quotaWindowSummary(google.subWindows)
+            logger.info("Google quota loaded: \(summary, privacy: .public)")
+        }
+        if let cursor = snapshot.cursor {
+            let summary = quotaWindowSummary(cursor.subWindows)
+            logger.info("Cursor quota loaded: \(summary, privacy: .public)")
+        }
+        return snapshot
+    }
+
+    private func quotaWindowSummary(_ windows: [SubQuotaWindow]) -> String {
+        windows
+            .map { String(format: "%@=%.2f%%", $0.label, $0.usedPercent) }
+            .joined(separator: ", ")
+    }
+
+    private func runOpenCodexQuotaCommand(forceRefresh: Bool) -> Data? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let process = Process()
+        let output = Pipe()
+        let finished = DispatchSemaphore(value: 0)
+
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["ocx", "provider", "quota"]
+            + (forceRefresh ? ["--refresh"] : [])
+            + ["--json"]
+        let preferredPaths = [
+            home + "/.npm-global/bin",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin"
+        ]
+        process.environment = [
+            "HOME": home,
+            "LANG": ProcessInfo.processInfo.environment["LANG"] ?? "en_US.UTF-8",
+            "PATH": preferredPaths.joined(separator: ":"),
+            "TMPDIR": FileManager.default.temporaryDirectory.path
+        ]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        process.terminationHandler = { _ in finished.signal() }
+
+        do {
+            try process.run()
+        } catch {
+            logger.error("Unable to launch ocx: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+
+        if finished.wait(timeout: .now() + 15) == .timedOut {
+            process.terminate()
+            logger.error("Timed out while loading provider quota")
+            return nil
+        }
+
+        guard process.terminationStatus == 0 else {
+            logger.error("ocx provider quota exited with status \(process.terminationStatus)")
+            return nil
+        }
+        return output.fileHandleForReading.readDataToEndOfFile()
+    }
+
+    private func parseProviderQuotaSnapshots(data: Data) -> ProviderQuotaSnapshots? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let reports = root["reports"] as? [[String: Any]] else {
+            return nil
+        }
+        let google = parseGoogleQuotaSnapshot(reports: reports)
+        let cursor = parseCursorQuotaSnapshot(reports: reports)
+        guard google != nil || cursor != nil else { return nil }
+        return ProviderQuotaSnapshots(google: google, cursor: cursor)
+    }
+
+    private func parseGoogleQuotaSnapshot(reports: [[String: Any]]) -> GoogleQuotaSnapshot? {
+        guard let report = reports.first(where: { $0["provider"] as? String == "google-antigravity" }),
+              let quota = report["quota"] as? [String: Any] else {
+            return nil
+        }
+        let rawWindows = quota["customWindows"] as? [[String: Any]] ?? []
+        let windows: [SubQuotaWindow] = rawWindows.compactMap { item in
+            guard let rawLabel = item["label"] as? String,
+                  let rawPercent = number(item["percent"]) else { return nil }
+
+            let normalized = rawLabel.lowercased()
+            let label: String
+            let hint: String?
+            if normalized == "gem" || normalized.contains("gemini") {
+                label = "Gemini 系列"
+                hint = "Google 自研模型"
+            } else if normalized == "cla" || normalized.contains("claude") {
+                label = "Claude 系列"
+                hint = "第三方托管模型"
+            } else {
+                label = rawLabel
+                hint = nil
+            }
+
+            let used = clampPercent(rawPercent)
+            return SubQuotaWindow(
+                label: label,
+                hint: hint,
+                usedPercent: used,
+                remainingPercent: 100 - used,
+                resetDate: dateFromEpoch(number(item["resetAt"]))
+            )
+        }
+        guard !windows.isEmpty else { return nil }
+        return GoogleQuotaSnapshot(
+            subWindows: windows,
+            resetDate: windows.compactMap(\.resetDate).min(),
+            updatedAt: dateFromEpoch(number(report["updatedAt"]) ?? number(quota["updatedAt"]))
+        )
+    }
+
+    private func parseCursorQuotaSnapshot(reports: [[String: Any]]) -> CursorQuotaSnapshot? {
+        guard let report = reports.first(where: { $0["provider"] as? String == "cursor" }),
+              let quota = report["quota"] as? [String: Any] else {
+            return nil
+        }
+
+        let monthlyUsed = number(quota["monthlyPercent"]).map(clampPercent)
+        let monthlyReset = dateFromEpoch(number(quota["monthlyResetAt"]))
+        let updatedAt = dateFromEpoch(number(report["updatedAt"]) ?? number(quota["updatedAt"]))
+        let experimental = (report["reverseEngineered"] as? Bool) ?? false
+        let rawWindows = quota["customWindows"] as? [[String: Any]] ?? []
+
+        var windows: [SubQuotaWindow] = rawWindows.compactMap { item in
+            guard let rawLabel = item["label"] as? String,
+                  let rawPercent = number(item["percent"]) else { return nil }
+
+            let normalized = rawLabel.lowercased()
+            let label: String
+            let hint: String?
+            if normalized.contains("first-party") {
+                label = "Cursor Models"
+                hint = "Cursor 第一方模型"
+            } else if normalized.contains("api usage") {
+                label = "Other Models"
+                hint = "Claude、GPT 等 API 用量"
+            } else {
+                label = rawLabel
+                hint = nil
+            }
+
+            let used = clampPercent(rawPercent)
+            return SubQuotaWindow(
+                label: label,
+                hint: hint,
+                usedPercent: used,
+                remainingPercent: 100 - used,
+                resetDate: dateFromEpoch(number(item["resetAt"])) ?? monthlyReset
+            )
+        }
+
+        if windows.isEmpty, let monthlyUsed {
+            windows = [SubQuotaWindow(
+                label: "Monthly usage",
+                hint: "Cursor 月度综合用量",
+                usedPercent: monthlyUsed,
+                remainingPercent: 100 - monthlyUsed,
+                resetDate: monthlyReset
+            )]
+        }
+
+        guard !windows.isEmpty else { return nil }
+        return CursorQuotaSnapshot(
+            subWindows: windows,
+            monthlyUsedPercent: monthlyUsed,
+            resetDate: monthlyReset ?? windows.compactMap(\.resetDate).first,
+            updatedAt: updatedAt,
+            experimental: experimental
+        )
+    }
+
+    private func number(_ value: Any?) -> Double? {
+        (value as? NSNumber)?.doubleValue
+    }
+
+    private func clampPercent(_ value: Double) -> Double {
+        min(100, max(0, value))
+    }
+
+    private func dateFromEpoch(_ value: Double?) -> Date? {
+        guard let value, value > 0 else { return nil }
+        return Date(timeIntervalSince1970: value > 1e11 ? value / 1000 : value)
     }
 
     private func loadUsageStats() -> ([ModelUsageStat], Int, Int, [String: (calls: Int, tokens: Int)]) {
@@ -512,6 +764,7 @@ struct GoogleAntigravityCardView: View {
     let disabled: Bool
     let subWindows: [SubQuotaWindow]
     let resetText: String
+    let statusText: String
     let calls24h: Int
     let tokens24h: Int
 
@@ -543,27 +796,39 @@ struct GoogleAntigravityCardView: View {
                 .foregroundColor(.secondary)
                 .lineLimit(1)
 
-            VStack(spacing: 6) {
-                ForEach(subWindows) { win in
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack {
-                            Text(win.label)
-                                .font(.system(size: 10, weight: .semibold))
-                            if let hint = win.hint {
-                                Text("· " + hint)
-                                    .font(.system(size: 9))
-                                    .foregroundColor(.secondary)
+            Text(statusText)
+                .font(.system(size: 9, weight: .medium))
+                .foregroundColor(statusText == "额度暂不可用" ? .orange : .secondary)
+                .lineLimit(1)
+
+            if subWindows.isEmpty {
+                Text("OpenCodeX 暂未返回 Google 配额报告")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .padding(.vertical, 4)
+            } else {
+                VStack(spacing: 6) {
+                    ForEach(subWindows) { win in
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack {
+                                Text(win.label)
+                                    .font(.system(size: 10, weight: .semibold))
+                                if let hint = win.hint {
+                                    Text("· " + hint)
+                                        .font(.system(size: 9))
+                                        .foregroundColor(.secondary)
+                                }
+                                Spacer()
+                                Text(String(format: "%.1f%% used", win.usedPercent))
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundColor(win.usedPercent > 80 ? .red : .primary)
                             }
-                            Spacer()
-                            Text(String(Int(round(win.usedPercent))) + "% used")
-                                .font(.system(size: 10, weight: .bold))
-                                .foregroundColor(win.usedPercent > 80 ? .red : .primary)
+                            QuotaProgressView(percent: win.usedPercent)
                         }
-                        QuotaProgressView(percent: win.usedPercent)
                     }
                 }
+                .padding(.top, 1)
             }
-            .padding(.top, 1)
 
             HStack {
                 HStack(spacing: 3) {
@@ -576,7 +841,7 @@ struct GoogleAntigravityCardView: View {
                 Spacer()
 
                 if calls24h > 0 {
-                    Text("24h: " + String(calls24h) + "次 · " + formatTokens(tokens24h))
+                    Text("OpenCodeX 24h: " + String(calls24h) + "次 · " + formatTokens(tokens24h))
                         .font(.system(size: 9.5, weight: .semibold))
                         .foregroundColor(Color.purple)
                 }
@@ -610,6 +875,8 @@ struct CursorQuotaCardView: View {
     let disabled: Bool
     let subWindows: [SubQuotaWindow]
     let resetText: String
+    let statusText: String
+    let experimental: Bool
     let calls24h: Int
     let tokens24h: Int
 
@@ -627,7 +894,7 @@ struct CursorQuotaCardView: View {
 
                 Spacer()
 
-                Text(disabled ? "DISABLED" : "PRO")
+                Text(disabled ? "DISABLED" : (experimental ? "PRO · EXP" : "PRO"))
                     .font(.system(size: 8.5, weight: .heavy))
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
@@ -641,28 +908,40 @@ struct CursorQuotaCardView: View {
                 .foregroundColor(.secondary)
                 .lineLimit(1)
 
-            VStack(spacing: 7) {
-                ForEach(subWindows) { win in
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack {
-                            Text(win.label)
-                                .font(.system(size: 10.5, weight: .semibold))
-                            if let hint = win.hint {
-                                Text("· " + hint)
-                                    .font(.system(size: 9))
-                                    .foregroundColor(.secondary)
-                                    .lineLimit(1)
+            Text(statusText)
+                .font(.system(size: 9, weight: .medium))
+                .foregroundColor(statusText == "额度暂不可用" ? .orange : .secondary)
+                .lineLimit(1)
+
+            if subWindows.isEmpty {
+                Text("OpenCodeX 暂未返回 Cursor 配额报告")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .padding(.vertical, 4)
+            } else {
+                VStack(spacing: 7) {
+                    ForEach(subWindows) { win in
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack {
+                                Text(win.label)
+                                    .font(.system(size: 10.5, weight: .semibold))
+                                if let hint = win.hint {
+                                    Text("· " + hint)
+                                        .font(.system(size: 9))
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+                                }
+                                Spacer()
+                                Text(String(format: "%.1f%% used", win.usedPercent))
+                                    .font(.system(size: 10.5, weight: .bold))
+                                    .foregroundColor(win.usedPercent > 80 ? .red : .primary)
                             }
-                            Spacer()
-                            Text(String(Int(round(win.usedPercent))) + "% used")
-                                .font(.system(size: 10.5, weight: .bold))
-                                .foregroundColor(win.usedPercent > 80 ? .red : .primary)
+                            QuotaProgressView(percent: win.usedPercent)
                         }
-                        QuotaProgressView(percent: win.usedPercent)
                     }
                 }
+                .padding(.top, 1)
             }
-            .padding(.top, 1)
 
             HStack {
                 HStack(spacing: 3) {
@@ -675,7 +954,7 @@ struct CursorQuotaCardView: View {
                 Spacer()
 
                 if calls24h > 0 {
-                    Text("24h: " + String(calls24h) + "次 · " + formatTokens(tokens24h))
+                    Text("OpenCodeX 24h: " + String(calls24h) + "次 · " + formatTokens(tokens24h))
                         .font(.system(size: 9.5, weight: .semibold))
                         .foregroundColor(Color.teal)
                 }
@@ -735,7 +1014,7 @@ struct PopoverContentView: View {
                 Spacer()
 
                 Button(action: {
-                    dm.refreshData()
+                    dm.refreshData(forceProviderQuotaRefresh: true)
                 }) {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 11, weight: .bold))
@@ -776,6 +1055,7 @@ struct PopoverContentView: View {
                             disabled: dm.googleDisabled,
                             subWindows: dm.googleSubWindows,
                             resetText: dm.googleResetText,
+                            statusText: dm.googleQuotaStatusText,
                             calls24h: dm.googleCalls24h,
                             tokens24h: dm.googleTokens24h
                         )
@@ -786,6 +1066,8 @@ struct PopoverContentView: View {
                             disabled: dm.cursorDisabled,
                             subWindows: dm.cursorSubWindows,
                             resetText: dm.cursorResetText,
+                            statusText: dm.cursorQuotaStatusText,
+                            experimental: dm.cursorQuotaExperimental,
                             calls24h: dm.cursorCalls24h,
                             tokens24h: dm.cursorTokens24h
                         )
