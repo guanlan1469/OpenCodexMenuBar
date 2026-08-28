@@ -20,7 +20,7 @@ pkill -x "$APP_NAME" >/dev/null 2>&1 || true
 
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_MACOS" "$MODULE_CACHE"
-cp "$ROOT_DIR/OpenCodexMenuBar.app/Contents/Info.plist" "$INFO_PLIST"
+cp "$ROOT_DIR/OpenCodexMenuBar.bundle-template/Contents/Info.plist" "$INFO_PLIST"
 
 xcrun swiftc \
   -module-cache-path "$MODULE_CACHE" \

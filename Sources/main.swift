@@ -11,10 +11,32 @@ struct OpenAiAccountItem: Identifiable {
     let email: String?
     let plan: String?
     let isMain: Bool
-    let usedPercent: Double
-    let remainingPercent: Double
-    let resetDate: Date?
+    let shortPercent: Double?
+    let shortRemainingPercent: Double?
+    let shortResetDate: Date?
+    let shortWindowSeconds: Int?
+    let weeklyPercent: Double
+    let weeklyRemainingPercent: Double
+    let weeklyResetDate: Date?
     let resetCredits: Int
+
+    var usedPercent: Double {
+        if let short = shortPercent {
+            return max(short, weeklyPercent)
+        }
+        return weeklyPercent
+    }
+
+    var remainingPercent: Double {
+        if let shortRem = shortRemainingPercent {
+            return min(shortRem, weeklyRemainingPercent)
+        }
+        return weeklyRemainingPercent
+    }
+
+    var resetDate: Date? {
+        weeklyResetDate
+    }
 }
 
 struct SubQuotaWindow: Identifiable {
@@ -200,10 +222,18 @@ class DataManager: ObservableObject {
                 let displayName = isMain ? "主账号 (Main)" : ((meta?["alias"] as? String) ?? (meta?["logLabel"] as? String) ?? key)
                 let email = (meta?["email"] as? String) ?? (isMain ? "主会话授权" : nil)
                 let plan = ((meta?["plan"] as? String)?.uppercased()) ?? (isMain ? "PLUS" : nil)
-                let used = (q["weeklyPercent"] as? Double) ?? 0.0
-                let rem = max(0, 100.0 - used)
-                let resetAt = q["weeklyResetAt"] as? Double
-                let resetDate = resetAt.flatMap { Date(timeIntervalSince1970: $0 > 1e11 ? $0 / 1000.0 : $0) }
+                
+                let weeklyUsed = (q["weeklyPercent"] as? Double) ?? 0.0
+                let weeklyRem = max(0, 100.0 - weeklyUsed)
+                let weeklyResetAt = q["weeklyResetAt"] as? Double
+                let weeklyResetDate = weeklyResetAt.flatMap { Date(timeIntervalSince1970: $0 > 1e11 ? $0 / 1000.0 : $0) }
+                
+                let shortUsed = q["shortPercent"] as? Double
+                let shortRem = shortUsed.map { max(0, 100.0 - $0) }
+                let shortResetAt = q["shortResetAt"] as? Double
+                let shortResetDate = shortResetAt.flatMap { Date(timeIntervalSince1970: $0 > 1e11 ? $0 / 1000.0 : $0) }
+                let shortWindowSeconds = q["shortWindowSeconds"] as? Int
+                
                 let credits = (q["resetCredits"] as? Int) ?? 0
 
                 openAiItems.append(OpenAiAccountItem(
@@ -212,9 +242,13 @@ class DataManager: ObservableObject {
                     email: email,
                     plan: plan,
                     isMain: isMain,
-                    usedPercent: used,
-                    remainingPercent: rem,
-                    resetDate: resetDate,
+                    shortPercent: shortUsed,
+                    shortRemainingPercent: shortRem,
+                    shortResetDate: shortResetDate,
+                    shortWindowSeconds: shortWindowSeconds,
+                    weeklyPercent: weeklyUsed,
+                    weeklyRemainingPercent: weeklyRem,
+                    weeklyResetDate: weeklyResetDate,
                     resetCredits: credits
                 ))
             }
@@ -343,6 +377,7 @@ class DataManager: ObservableObject {
             + (forceRefresh ? ["--refresh"] : [])
             + ["--json"]
         let preferredPaths = [
+            home + "/.local/bin",
             home + "/.npm-global/bin",
             "/opt/homebrew/bin",
             "/usr/local/bin",
@@ -601,7 +636,7 @@ struct OpenAiAccountRowView: View {
     let acc: OpenAiAccountItem
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack {
                 HStack(spacing: 4) {
                     Image(systemName: acc.isMain ? "crown.fill" : "person.fill")
@@ -621,34 +656,79 @@ struct OpenAiAccountRowView: View {
 
                 Spacer()
 
-                Text(String(Int(round(acc.usedPercent))) + "% 已用")
-                    .font(.system(size: 10.5, weight: .bold))
-                    .foregroundColor(acc.usedPercent > 80 ? .red : .primary)
-                Text("(余 " + String(Int(round(acc.remainingPercent))) + "%)")
-                    .font(.system(size: 9.5))
-                    .foregroundColor(.secondary)
-            }
-
-            QuotaProgressView(percent: acc.usedPercent)
-
-            HStack {
-                if let reset = acc.resetDate {
-                    HStack(spacing: 3) {
-                        Image(systemName: "clock.arrow.circlepath")
-                        Text(formatResetTime(reset))
-                    }
-                    .font(.system(size: 9))
-                    .foregroundColor(.secondary)
+                if let plan = acc.plan {
+                    Text(plan)
+                        .font(.system(size: 8.5, weight: .bold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1.5)
+                        .background(Color.orange.opacity(0.12))
+                        .foregroundColor(Color.orange)
+                        .clipShape(Capsule())
                 }
-                Spacer()
+
                 if acc.resetCredits > 0 {
-                    HStack(spacing: 3) {
+                    HStack(spacing: 2) {
                         Image(systemName: "ticket.fill")
-                        Text("重置券: " + String(acc.resetCredits))
+                        Text(String(acc.resetCredits))
                     }
                     .font(.system(size: 9, weight: .bold))
                     .foregroundColor(.green)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1.5)
+                    .background(Color.green.opacity(0.12))
+                    .clipShape(Capsule())
                 }
+            }
+
+            if let shortUsed = acc.shortPercent {
+                let shortRem = acc.shortRemainingPercent ?? max(0, 100.0 - shortUsed)
+                VStack(alignment: .leading, spacing: 2.5) {
+                    HStack {
+                        HStack(spacing: 3) {
+                            Text("5小时限制")
+                                .font(.system(size: 9.5, weight: .semibold))
+                            if let reset = acc.shortResetDate {
+                                Text("· " + formatShortResetTime(reset))
+                                    .font(.system(size: 8.5))
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+
+                        Spacer()
+
+                        Text(String(Int(round(shortUsed))) + "% 已用")
+                            .font(.system(size: 9.5, weight: .bold))
+                            .foregroundColor(shortUsed > 80 ? .red : .primary)
+                        Text("(余 " + String(Int(round(shortRem))) + "%)")
+                            .font(.system(size: 8.5))
+                            .foregroundColor(.secondary)
+                    }
+                    QuotaProgressView(percent: shortUsed)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 2.5) {
+                HStack {
+                    HStack(spacing: 3) {
+                        Text(acc.shortPercent != nil ? "周配额" : "额度")
+                            .font(.system(size: 9.5, weight: .semibold))
+                        if let reset = acc.weeklyResetDate {
+                            Text("· " + formatWeeklyResetTime(reset))
+                                .font(.system(size: 8.5))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                    Spacer()
+
+                    Text(String(Int(round(acc.weeklyPercent))) + "% 已用")
+                        .font(.system(size: 9.5, weight: .bold))
+                        .foregroundColor(acc.weeklyPercent > 80 ? .red : .primary)
+                    Text("(余 " + String(Int(round(acc.weeklyRemainingPercent))) + "%)")
+                        .font(.system(size: 8.5))
+                        .foregroundColor(.secondary)
+                }
+                QuotaProgressView(percent: acc.weeklyPercent)
             }
         }
         .padding(8)
@@ -658,7 +738,18 @@ struct OpenAiAccountRowView: View {
         )
     }
 
-    private func formatResetTime(_ date: Date) -> String {
+    private func formatShortResetTime(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        let calendar = Calendar.current
+        if calendar.isDateInToday(date) {
+            formatter.dateFormat = "HH:mm 恢复"
+        } else {
+            formatter.dateFormat = "M-d HH:mm 恢复"
+        }
+        return formatter.string(from: date)
+    }
+
+    private func formatWeeklyResetTime(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "M-d HH:mm 周重置"
         return formatter.string(from: date)

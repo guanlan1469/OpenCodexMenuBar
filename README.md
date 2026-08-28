@@ -8,7 +8,7 @@
 
 - **⚡️ 菜单栏常驻概览**：顶部状态栏实时显示主力账号剩余可用额度百分比（如 `⚡️ 82%`），不占 Dock 栏空间。
 - **📊 核心模型通道配额聚合**：
-  - **OpenAI · 账号池**：统一聚合主账号（Main）与多个备用账号，展示周额度进度条、已用/剩余百分比、重置时间与重置券。
+  - **OpenAI · 账号池**：统一聚合主账号（Main）与多个备用账号，分别展示 5小时速率限制（短周期已用/剩余/恢复时间）与周度配额（周已用/剩余/重置时间）双进度条及重置券。
   - **Google · Antigravity**：读取本机 OpenCodeX provider quota 报告，分别展示 Gemini（自研池）与 Claude（第三方池）的实时配额水位、更新时间和最近恢复时间；数据不可用时明确提示，不使用固定占位百分比。
   - **Cursor · Included in Pro**：读取本机 OpenCodeX 的实验性 provider quota 报告，拆分展示 `Cursor Models`（第一方模型）与 `Other Models`（API 用量）配额水位、更新时间和真实重置时间；数据不可用时明确提示，不使用固定占位百分比。
 - **🔥 24小时模型消耗排行**：自动解析 `~/.opencodex/usage.jsonl`，按模型统计过去 24 小时的调用频次与 Token 吞吐。
@@ -21,7 +21,7 @@
 
 - `Sources/main.swift`：菜单栏应用主程序源码 (SwiftUI + AppKit)
 - `Sources/render_preview.swift`：离线高保真位图渲染器
-- `OpenCodexMenuBar.app`：标准 macOS 应用 Bundle
+- `OpenCodexMenuBar.bundle-template`：构建应用时使用的 Bundle 模板（避免被系统识别成重复 App）
 - `双击启动菜单栏工具.command`：一键启动脚本
 - `opencodex_menubar_preview.png`：预览效果截图
 
