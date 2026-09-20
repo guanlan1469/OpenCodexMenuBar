@@ -6,3 +6,10 @@
 /tmp/
 *.swp
 *~
+
+# Generated executables and obsolete live-data previews
+/OpenCodexMenuBar
+/render_preview
+/opencodex_menubar_preview.png
+/OpenCodexMenuBar.bundle-template/Contents/MacOS/
+/OpenCodexMenuBar.bundle-template/Contents/_CodeSignature/

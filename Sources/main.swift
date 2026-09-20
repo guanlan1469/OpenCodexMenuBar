@@ -1,101 +1,7 @@
 import Cocoa
 import os
 import SwiftUI
-
-// MARK: - Models
-
-struct OpenAiAccountItem: Identifiable {
-    var id: String { key }
-    let key: String
-    let name: String
-    let email: String?
-    let plan: String?
-    let isMain: Bool
-    let shortPercent: Double?
-    let shortRemainingPercent: Double?
-    let shortResetDate: Date?
-    let shortWindowSeconds: Int?
-    let weeklyPercent: Double
-    let weeklyRemainingPercent: Double
-    let weeklyResetDate: Date?
-    let resetCredits: Int
-
-    var usedPercent: Double {
-        if let short = shortPercent {
-            return max(short, weeklyPercent)
-        }
-        return weeklyPercent
-    }
-
-    var remainingPercent: Double {
-        if let shortRem = shortRemainingPercent {
-            return min(shortRem, weeklyRemainingPercent)
-        }
-        return weeklyRemainingPercent
-    }
-
-    var resetDate: Date? {
-        weeklyResetDate
-    }
-}
-
-struct SubQuotaWindow: Identifiable {
-    var id: String { label }
-    let label: String
-    let hint: String?
-    let usedPercent: Double
-    let remainingPercent: Double
-    let resetDate: Date?
-}
-
-struct CursorQuotaSnapshot {
-    let subWindows: [SubQuotaWindow]
-    let monthlyUsedPercent: Double?
-    let resetDate: Date?
-    let updatedAt: Date?
-    let experimental: Bool
-}
-
-struct GoogleQuotaSnapshot {
-    let subWindows: [SubQuotaWindow]
-    let resetDate: Date?
-    let updatedAt: Date?
-}
-
-struct ProviderQuotaSnapshots {
-    let google: GoogleQuotaSnapshot?
-    let cursor: CursorQuotaSnapshot?
-}
-
-struct ProviderSectionData {
-    let openAiAccounts: [OpenAiAccountItem]
-    let googleSubWindows: [SubQuotaWindow]
-    let googleEmail: String
-    let googleDisabled: Bool
-    let googleResetText: String
-    let googleQuotaStatusText: String
-    let googleCalls24h: Int
-    let googleTokens24h: Int
-    
-    let cursorSubWindows: [SubQuotaWindow]
-    let cursorUser: String
-    let cursorDisabled: Bool
-    let cursorResetDate: Date?
-    let cursorResetText: String
-    let cursorQuotaStatusText: String
-    let cursorQuotaExperimental: Bool
-    let cursorCalls24h: Int
-    let cursorTokens24h: Int
-}
-
-struct ModelUsageStat: Identifiable {
-    var id: String { model }
-    let model: String
-    let provider: String
-    let calls: Int
-    let tokens: Int
-    let lastSeen: Date
-}
+import Combine
 
 // MARK: - Data Manager
 
@@ -125,6 +31,11 @@ class DataManager: ObservableObject {
     @Published var lastRefreshTime: Date = Date()
     @Published var summaryTitle: String = "⚡️ ..."
 
+    @Published private(set) var isRefreshing = false
+    @Published private(set) var usageAvailable = true
+    private let usageReader = UsageLogReader()
+    private var googleRefreshFailed = false
+    private var cursorRefreshFailed = false
     private var timer: Timer?
     private let refreshQueue = DispatchQueue(label: "com.zhoujie.opencodex.menubar.refresh", qos: .utility)
     private let logger = Logger(subsystem: "com.zhoujie.opencodex.menubar", category: "quota")
@@ -137,16 +48,28 @@ class DataManager: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
             self?.refreshData()
         }
+        timer?.tolerance = 2
     }
 
     func refreshData(forceProviderQuotaRefresh: Bool = false) {
+        // All callers are on the main thread; coalesce timer, click and popover requests.
+        guard !isRefreshing else { return }
+        isRefreshing = true
         refreshQueue.async { [weak self] in
             guard let self = self else { return }
             let (models, calls, tokens, providerStats) = self.loadUsageStats()
+            let localData = self.loadSectionData(providerStats: providerStats, providerQuotas: self.cachedProviderQuotas)
+            DispatchQueue.main.async {
+                self.openAiAccounts = localData.openAiAccounts
+                self.summaryTitle = localData.openAiAccounts.first(where: { $0.isMain })?.summary() ?? "⚡️ --"
+            }
             let providerQuotas = self.loadProviderQuotasIfNeeded(forceRefresh: forceProviderQuotaRefresh)
             let sectionData = self.loadSectionData(providerStats: providerStats, providerQuotas: providerQuotas)
 
+            let usageAvailable = self.usageReader.isAvailable
             DispatchQueue.main.async {
+                self.isRefreshing = false
+                self.usageAvailable = usageAvailable
                 self.openAiAccounts = sectionData.openAiAccounts
                 self.googleSubWindows = sectionData.googleSubWindows
                 self.googleEmail = sectionData.googleEmail
@@ -171,12 +94,7 @@ class DataManager: ObservableObject {
                 self.totalTokens24h = tokens
                 self.lastRefreshTime = Date()
 
-                if let mainOpenAI = sectionData.openAiAccounts.first(where: { $0.isMain }) {
-                    let rem = Int(round(mainOpenAI.remainingPercent))
-                    self.summaryTitle = "⚡️ " + String(rem) + "%"
-                } else {
-                    self.summaryTitle = "⚡️ OpenCodex"
-                }
+                self.summaryTitle = sectionData.openAiAccounts.first(where: { $0.isMain })?.summary() ?? "⚡️ --"
             }
         }
     }
@@ -221,14 +139,14 @@ class DataManager: ObservableObject {
                 let meta = accountsMeta[key]
                 let displayName = isMain ? "主账号 (Main)" : ((meta?["alias"] as? String) ?? (meta?["logLabel"] as? String) ?? key)
                 let email = (meta?["email"] as? String) ?? (isMain ? "主会话授权" : nil)
-                let plan = ((meta?["plan"] as? String)?.uppercased()) ?? (isMain ? "PLUS" : nil)
+                let plan = (meta?["plan"] as? String)?.uppercased()
                 
-                let weeklyUsed = (q["weeklyPercent"] as? Double) ?? 0.0
-                let weeklyRem = max(0, 100.0 - weeklyUsed)
+                let weeklyUsed = QuotaValue.percent(q["weeklyPercent"])
+                let weeklyRem = weeklyUsed.map { 100 - $0 }
                 let weeklyResetAt = q["weeklyResetAt"] as? Double
                 let weeklyResetDate = weeklyResetAt.flatMap { Date(timeIntervalSince1970: $0 > 1e11 ? $0 / 1000.0 : $0) }
                 
-                let shortUsed = q["shortPercent"] as? Double
+                let shortUsed = QuotaValue.percent(q["shortPercent"])
                 let shortRem = shortUsed.map { max(0, 100.0 - $0) }
                 let shortResetAt = q["shortResetAt"] as? Double
                 let shortResetDate = shortResetAt.flatMap { Date(timeIntervalSince1970: $0 > 1e11 ? $0 / 1000.0 : $0) }
@@ -249,13 +167,15 @@ class DataManager: ObservableObject {
                     weeklyPercent: weeklyUsed,
                     weeklyRemainingPercent: weeklyRem,
                     weeklyResetDate: weeklyResetDate,
-                    resetCredits: credits
+                    resetCredits: credits,
+                    updatedAt: dateFromEpoch(number(q["updatedAt"]))
                 ))
             }
         }
         openAiItems.sort {
             if $0.isMain != $1.isMain { return $0.isMain }
-            return $0.remainingPercent > $1.remainingPercent
+            return ($0.remainingPercent ?? -1) == ($1.remainingPercent ?? -1)
+                ? $0.key < $1.key : ($0.remainingPercent ?? -1) > ($1.remainingPercent ?? -1)
         }
 
         // 2. Google Antigravity：额度由 OpenCodeX 的 provider quota 报告提供。
@@ -272,11 +192,8 @@ class DataManager: ObservableObject {
         let googleResetFormatter = DateFormatter()
         googleResetFormatter.dateFormat = "M-d HH:mm 最近恢复"
         let googleResetText = googleQuota?.resetDate.map(googleResetFormatter.string(from:)) ?? "恢复时间未知"
-        let quotaStatusFormatter = DateFormatter()
-        quotaStatusFormatter.dateFormat = "HH:mm"
-        let googleQuotaStatusText = googleQuota?.updatedAt
-            .map { "实时 · 更新 " + quotaStatusFormatter.string(from: $0) }
-            ?? (googleQuota == nil ? "额度暂不可用" : "实时 · 更新时间未知")
+        let googleQuotaStatusText = QuotaValue.status(updatedAt: googleQuota?.updatedAt,
+            available: googleQuota != nil, failed: googleRefreshFailed)
 
         // 3. Cursor：额度由 OpenCodeX 的 provider quota 报告提供。
         let cursorCfg = configProviders["cursor"] as? [String: Any]
@@ -293,18 +210,8 @@ class DataManager: ObservableObject {
         resetFormatter.dateFormat = "M-d HH:mm 月度重置"
         let cursorResetText = cursorResetDate.map(resetFormatter.string(from:)) ?? "重置时间未知"
 
-        let cursorQuotaStatusText: String
-        if let quota = cursorQuota {
-            let prefix = quota.experimental ? "实验性" : "实时"
-            let updated = quota.updatedAt.map { quotaStatusFormatter.string(from: $0) } ?? "未知"
-            if let monthly = quota.monthlyUsedPercent {
-                cursorQuotaStatusText = String(format: "%@ · 综合已用 %.1f%% · 更新 %@", prefix, monthly, updated)
-            } else {
-                cursorQuotaStatusText = "\(prefix) · 更新 \(updated)"
-            }
-        } else {
-            cursorQuotaStatusText = "额度暂不可用"
-        }
+        let cursorQuotaStatusText = QuotaValue.status(updatedAt: cursorQuota?.updatedAt,
+            available: cursorQuota != nil, failed: cursorRefreshFailed)
 
         let cursorSubWindows = cursorQuota?.subWindows ?? []
 
@@ -332,18 +239,21 @@ class DataManager: ObservableObject {
     private func loadProviderQuotasIfNeeded(forceRefresh: Bool) -> ProviderQuotaSnapshots? {
         let now = Date()
         if !forceRefresh,
-           let cached = cachedProviderQuotas,
            now.timeIntervalSince(lastProviderQuotaFetchAttempt) < providerQuotaRefreshInterval {
-            return cached
+            return cachedProviderQuotas
         }
 
         lastProviderQuotaFetchAttempt = now
         guard let data = runOpenCodexQuotaCommand(forceRefresh: forceRefresh),
-              let parsed = parseProviderQuotaSnapshots(data: data) else {
+              let parsed = ProviderQuotaParser.parse(data: data) else {
+            googleRefreshFailed = true
+            cursorRefreshFailed = true
             logger.error("Provider quota refresh failed; retaining the last valid snapshots")
             return cachedProviderQuotas
         }
 
+        googleRefreshFailed = parsed.google == nil
+        cursorRefreshFailed = parsed.cursor == nil
         let snapshot = ProviderQuotaSnapshots(
             google: parsed.google ?? cachedProviderQuotas?.google,
             cursor: parsed.cursor ?? cachedProviderQuotas?.cursor
@@ -368,14 +278,6 @@ class DataManager: ObservableObject {
 
     private func runOpenCodexQuotaCommand(forceRefresh: Bool) -> Data? {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let process = Process()
-        let output = Pipe()
-        let finished = DispatchSemaphore(value: 0)
-
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["ocx", "provider", "quota"]
-            + (forceRefresh ? ["--refresh"] : [])
-            + ["--json"]
         let preferredPaths = [
             home + "/.local/bin",
             home + "/.npm-global/bin",
@@ -386,154 +288,24 @@ class DataManager: ObservableObject {
             "/usr/sbin",
             "/sbin"
         ]
-        process.environment = [
+        let environment = [
             "HOME": home,
             "LANG": ProcessInfo.processInfo.environment["LANG"] ?? "en_US.UTF-8",
             "PATH": preferredPaths.joined(separator: ":"),
             "TMPDIR": FileManager.default.temporaryDirectory.path
         ]
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-        process.terminationHandler = { _ in finished.signal() }
-
         do {
-            try process.run()
+            return try QuotaCommand.run(executable: "/usr/bin/env",
+                arguments: ["ocx", "provider", "quota"] + (forceRefresh ? ["--refresh"] : []) + ["--json"],
+                environment: environment)
         } catch {
-            logger.error("Unable to launch ocx: \(error.localizedDescription, privacy: .public)")
+            logger.error("Provider quota command failed: \(error.localizedDescription, privacy: .public)")
             return nil
         }
-
-        if finished.wait(timeout: .now() + 15) == .timedOut {
-            process.terminate()
-            logger.error("Timed out while loading provider quota")
-            return nil
-        }
-
-        guard process.terminationStatus == 0 else {
-            logger.error("ocx provider quota exited with status \(process.terminationStatus)")
-            return nil
-        }
-        return output.fileHandleForReading.readDataToEndOfFile()
-    }
-
-    private func parseProviderQuotaSnapshots(data: Data) -> ProviderQuotaSnapshots? {
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let reports = root["reports"] as? [[String: Any]] else {
-            return nil
-        }
-        let google = parseGoogleQuotaSnapshot(reports: reports)
-        let cursor = parseCursorQuotaSnapshot(reports: reports)
-        guard google != nil || cursor != nil else { return nil }
-        return ProviderQuotaSnapshots(google: google, cursor: cursor)
-    }
-
-    private func parseGoogleQuotaSnapshot(reports: [[String: Any]]) -> GoogleQuotaSnapshot? {
-        guard let report = reports.first(where: { $0["provider"] as? String == "google-antigravity" }),
-              let quota = report["quota"] as? [String: Any] else {
-            return nil
-        }
-        let rawWindows = quota["customWindows"] as? [[String: Any]] ?? []
-        let windows: [SubQuotaWindow] = rawWindows.compactMap { item in
-            guard let rawLabel = item["label"] as? String,
-                  let rawPercent = number(item["percent"]) else { return nil }
-
-            let normalized = rawLabel.lowercased()
-            let label: String
-            let hint: String?
-            if normalized == "gem" || normalized.contains("gemini") {
-                label = "Gemini 系列"
-                hint = "Google 自研模型"
-            } else if normalized == "cla" || normalized.contains("claude") {
-                label = "Claude 系列"
-                hint = "第三方托管模型"
-            } else {
-                label = rawLabel
-                hint = nil
-            }
-
-            let used = clampPercent(rawPercent)
-            return SubQuotaWindow(
-                label: label,
-                hint: hint,
-                usedPercent: used,
-                remainingPercent: 100 - used,
-                resetDate: dateFromEpoch(number(item["resetAt"]))
-            )
-        }
-        guard !windows.isEmpty else { return nil }
-        return GoogleQuotaSnapshot(
-            subWindows: windows,
-            resetDate: windows.compactMap(\.resetDate).min(),
-            updatedAt: dateFromEpoch(number(report["updatedAt"]) ?? number(quota["updatedAt"]))
-        )
-    }
-
-    private func parseCursorQuotaSnapshot(reports: [[String: Any]]) -> CursorQuotaSnapshot? {
-        guard let report = reports.first(where: { $0["provider"] as? String == "cursor" }),
-              let quota = report["quota"] as? [String: Any] else {
-            return nil
-        }
-
-        let monthlyUsed = number(quota["monthlyPercent"]).map(clampPercent)
-        let monthlyReset = dateFromEpoch(number(quota["monthlyResetAt"]))
-        let updatedAt = dateFromEpoch(number(report["updatedAt"]) ?? number(quota["updatedAt"]))
-        let experimental = (report["reverseEngineered"] as? Bool) ?? false
-        let rawWindows = quota["customWindows"] as? [[String: Any]] ?? []
-
-        var windows: [SubQuotaWindow] = rawWindows.compactMap { item in
-            guard let rawLabel = item["label"] as? String,
-                  let rawPercent = number(item["percent"]) else { return nil }
-
-            let normalized = rawLabel.lowercased()
-            let label: String
-            let hint: String?
-            if normalized.contains("first-party") {
-                label = "Cursor Models"
-                hint = "Cursor 第一方模型"
-            } else if normalized.contains("api usage") {
-                label = "Other Models"
-                hint = "Claude、GPT 等 API 用量"
-            } else {
-                label = rawLabel
-                hint = nil
-            }
-
-            let used = clampPercent(rawPercent)
-            return SubQuotaWindow(
-                label: label,
-                hint: hint,
-                usedPercent: used,
-                remainingPercent: 100 - used,
-                resetDate: dateFromEpoch(number(item["resetAt"])) ?? monthlyReset
-            )
-        }
-
-        if windows.isEmpty, let monthlyUsed {
-            windows = [SubQuotaWindow(
-                label: "Monthly usage",
-                hint: "Cursor 月度综合用量",
-                usedPercent: monthlyUsed,
-                remainingPercent: 100 - monthlyUsed,
-                resetDate: monthlyReset
-            )]
-        }
-
-        guard !windows.isEmpty else { return nil }
-        return CursorQuotaSnapshot(
-            subWindows: windows,
-            monthlyUsedPercent: monthlyUsed,
-            resetDate: monthlyReset ?? windows.compactMap(\.resetDate).first,
-            updatedAt: updatedAt,
-            experimental: experimental
-        )
     }
 
     private func number(_ value: Any?) -> Double? {
-        (value as? NSNumber)?.doubleValue
-    }
-
-    private func clampPercent(_ value: Double) -> Double {
-        min(100, max(0, value))
+        QuotaValue.number(value)
     }
 
     private func dateFromEpoch(_ value: Double?) -> Date? {
@@ -542,60 +314,8 @@ class DataManager: ObservableObject {
     }
 
     private func loadUsageStats() -> ([ModelUsageStat], Int, Int, [String: (calls: Int, tokens: Int)]) {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let usageURL = home.appendingPathComponent(".opencodex/usage.jsonl")
-
-        guard let fileContent = try? String(contentsOf: usageURL, encoding: .utf8) else {
-            return ([], 0, 0, [:])
-        }
-
-        let now = Date().timeIntervalSince1970 * 1000.0
-        let dayAgo = now - 24 * 3600 * 1000.0
-
-        var modelCounts: [String: (provider: String, calls: Int, tokens: Int, lastSeen: Double)] = [:]
-        var providerCounts: [String: (calls: Int, tokens: Int)] = [:]
-        var total24hCalls = 0
-        var total24hTokens = 0
-
-        let lines = fileContent.components(separatedBy: CharacterSet.newlines)
-        for line in lines.reversed() {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { continue }
-            guard let data = trimmed.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                continue
-            }
-
-            let ts = (json["timestamp"] as? Double) ?? 0
-            if ts < dayAgo { continue }
-
-            let model = (json["model"] as? String) ?? (json["resolvedModel"] as? String) ?? "unknown"
-            let provider = (json["provider"] as? String) ?? "unknown"
-            let tokens = (json["totalTokens"] as? Int) ?? 0
-
-            total24hCalls += 1
-            total24hTokens += tokens
-
-            var curr = modelCounts[model] ?? (provider: provider, calls: 0, tokens: 0, lastSeen: ts)
-            curr.calls += 1
-            curr.tokens += tokens
-            curr.lastSeen = max(curr.lastSeen, ts)
-            modelCounts[model] = curr
-
-            var pCurr = providerCounts[provider] ?? (0, 0)
-            pCurr.calls += 1
-            pCurr.tokens += tokens
-            providerCounts[provider] = pCurr
-        }
-
-        var stats: [ModelUsageStat] = []
-        for (m, d) in modelCounts {
-            let lastDate = Date(timeIntervalSince1970: d.lastSeen > 1e11 ? d.lastSeen / 1000.0 : d.lastSeen)
-            stats.append(ModelUsageStat(model: m, provider: d.provider, calls: d.calls, tokens: d.tokens, lastSeen: lastDate))
-        }
-
-        stats.sort { $0.tokens > $1.tokens }
-        return (stats, total24hCalls, total24hTokens, providerCounts)
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".opencodex/usage.jsonl")
+        return usageReader.load(url: url)
     }
 }
 
@@ -625,7 +345,7 @@ struct QuotaProgressView: View {
                             endPoint: .trailing
                         )
                     )
-                    .frame(width: max(5, geo.size.width * CGFloat(min(100, max(0, percent)) / 100.0)), height: 6.5)
+                    .frame(width: max(0, geo.size.width * CGFloat(min(100, max(0, percent)) / 100.0)), height: 6.5)
             }
         }
         .frame(height: 6.5)
@@ -685,7 +405,7 @@ struct OpenAiAccountRowView: View {
                 VStack(alignment: .leading, spacing: 2.5) {
                     HStack {
                         HStack(spacing: 3) {
-                            Text("5小时限制")
+                            Text(acc.shortLabel)
                                 .font(.system(size: 9.5, weight: .semibold))
                             if let reset = acc.shortResetDate {
                                 Text("· " + formatShortResetTime(reset))
@@ -707,29 +427,38 @@ struct OpenAiAccountRowView: View {
                 }
             }
 
-            VStack(alignment: .leading, spacing: 2.5) {
-                HStack {
-                    HStack(spacing: 3) {
-                        Text(acc.shortPercent != nil ? "周配额" : "额度")
-                            .font(.system(size: 9.5, weight: .semibold))
-                        if let reset = acc.weeklyResetDate {
-                            Text("· " + formatWeeklyResetTime(reset))
-                                .font(.system(size: 8.5))
-                                .foregroundColor(.secondary)
+            if let weeklyUsed = acc.weeklyPercent {
+                VStack(alignment: .leading, spacing: 2.5) {
+                    HStack {
+                        HStack(spacing: 3) {
+                            Text("周配额")
+                                .font(.system(size: 9.5, weight: .semibold))
+                            if let reset = acc.weeklyResetDate {
+                                Text("· " + formatWeeklyResetTime(reset))
+                                    .font(.system(size: 8.5))
+                                    .foregroundColor(.secondary)
+                            }
                         }
+
+                        Spacer()
+
+                        Text(String(Int(round(weeklyUsed))) + "% 已用")
+                            .font(.system(size: 9.5, weight: .bold))
+                            .foregroundColor(weeklyUsed > 80 ? .red : .primary)
+                        Text("(余 " + String(Int(round(100 - weeklyUsed))) + "%)")
+                            .font(.system(size: 8.5))
+                            .foregroundColor(.secondary)
                     }
-
-                    Spacer()
-
-                    Text(String(Int(round(acc.weeklyPercent))) + "% 已用")
-                        .font(.system(size: 9.5, weight: .bold))
-                        .foregroundColor(acc.weeklyPercent > 80 ? .red : .primary)
-                    Text("(余 " + String(Int(round(acc.weeklyRemainingPercent))) + "%)")
-                        .font(.system(size: 8.5))
-                        .foregroundColor(.secondary)
+                    QuotaProgressView(percent: weeklyUsed)
                 }
-                QuotaProgressView(percent: acc.weeklyPercent)
+            } else {
+                Text("周配额暂不可用").font(.system(size: 9.5)).foregroundColor(.secondary)
             }
+            if acc.shortPercent == nil {
+                Text("短周期额度暂不可用").font(.system(size: 9.5)).foregroundColor(.secondary)
+            }
+            Text(QuotaValue.status(updatedAt: acc.updatedAt, available: acc.usedPercent != nil, failed: false))
+                .font(.system(size: 9)).foregroundColor(.secondary)
         }
         .padding(8)
         .background(
@@ -825,7 +554,7 @@ struct OpenAiUnifiedCardView: View {
                         Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                             .font(.system(size: 8.5, weight: .bold))
 
-                        Text(isExpanded ? "收起备用/已用尽账号" : ("展开其他 " + String(secondaryAccounts.count) + " 个备用账号" + (secondaryAccounts.contains(where: { $0.usedPercent >= 100 }) ? " (含用尽)" : "")))
+                        Text(isExpanded ? "收起备用/已用尽账号" : ("展开其他 " + String(secondaryAccounts.count) + " 个备用账号" + (secondaryAccounts.contains(where: { ($0.usedPercent ?? 0) >= 100 }) ? " (含用尽)" : "")))
                             .font(.system(size: 9.5, weight: .medium))
 
                         Spacer()
@@ -1114,6 +843,8 @@ struct PopoverContentView: View {
                         .background(Circle().fill(Color.primary.opacity(0.06)))
                 }
                 .buttonStyle(.plain)
+                .disabled(dm.isRefreshing)
+                .accessibilityLabel(dm.isRefreshing ? "正在刷新" : "立即刷新数据")
                 .help("立即刷新数据")
             }
             .padding(.horizontal, 16)
@@ -1138,6 +869,9 @@ struct PopoverContentView: View {
                         // 1. OpenAI 多账号卡片 (周重置)
                         if !dm.openAiAccounts.isEmpty {
                             OpenAiUnifiedCardView(accounts: dm.openAiAccounts)
+                        } else {
+                            Text("OpenAI 额度暂不可用 · 等待本地缓存")
+                                .font(.system(size: 11)).foregroundColor(.secondary)
                         }
 
                         // 2. Google Antigravity 卡片 (滑动窗口恢复)
@@ -1176,7 +910,7 @@ struct PopoverContentView: View {
                         }
 
                         if dm.topModels24h.isEmpty {
-                            Text("过去 24 小时暂无调用记录")
+                            Text(dm.usageAvailable ? "过去 24 小时暂无调用记录" : "用量日志暂不可读")
                                 .font(.system(size: 11))
                                 .foregroundColor(.secondary)
                                 .padding(.vertical, 4)
@@ -1211,7 +945,7 @@ struct PopoverContentView: View {
 
             // Footer
             HStack {
-                Text("刷新: " + formatUpdateTime(dm.lastRefreshTime))
+                Text(dm.isRefreshing ? "正在刷新…" : "本地检查: " + formatUpdateTime(dm.lastRefreshTime))
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
 
@@ -1271,6 +1005,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     var popover: NSPopover?
     let dataManager = DataManager()
+    private var titleSubscription: AnyCancellable?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -1287,15 +1022,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         pop.contentViewController = NSHostingController(rootView: PopoverContentView(dm: dataManager))
         self.popover = pop
 
-        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.updateButtonTitle()
+        titleSubscription = dataManager.$summaryTitle.removeDuplicates().sink { [weak self] title in
+            self?.statusItem?.button?.title = title
+            self?.statusItem?.button?.setAccessibilityLabel("OpenCodex 额度 " + title)
         }
     }
 
-    private func updateButtonTitle() {
-        if let button = statusItem?.button {
-            button.title = dataManager.summaryTitle
-        }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if popover?.isShown != true { togglePopover() }
+        return true
     }
 
     @objc func togglePopover() {
