@@ -75,7 +75,7 @@ struct ProviderSectionData {
     let googleQuotaStatusText: String
     let googleCalls24h: Int
     let googleTokens24h: Int
-    
+
     let cursorSubWindows: [SubQuotaWindow]
     let cursorUser: String
     let cursorDisabled: Bool
