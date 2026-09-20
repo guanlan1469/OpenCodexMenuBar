@@ -22,7 +22,7 @@ mkdir -p "$APP_BUNDLE/Contents/MacOS" "$BUILD_DIR/ModuleCache"
 cp "$ROOT_DIR/OpenCodexMenuBar.bundle-template/Contents/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 xcrun swiftc -module-cache-path "$BUILD_DIR/ModuleCache" \
   -target "$(uname -m)-apple-macos13.0" -O \
-  "$ROOT_DIR/Sources/QuotaCore.swift" "$ROOT_DIR/Sources/main.swift" \
+  "$ROOT_DIR/Sources/QuotaCore.swift" "$ROOT_DIR/Sources/QuotaViews.swift" "$ROOT_DIR/Sources/main.swift" \
   -o "$APP_BUNDLE/Contents/MacOS/$APP_NAME" -framework Cocoa -framework SwiftUI
 /usr/bin/codesign --force --sign - "$APP_BUNDLE"
 /usr/bin/codesign --verify --deep --strict "$APP_BUNDLE"

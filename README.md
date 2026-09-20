@@ -6,6 +6,8 @@
 
 面板顶部直接显示当前运行的版本号，便于确认应用是否已经更新。
 
+界面分为“额度概览”和“24 小时用量”两个页签。额度页采用并排的大号剩余百分比，所有额度进度条统一表示剩余量；低余量以橙色或红色提示。停用通道默认折叠，点击可查看详情。用量页显示总调用量、Token 总量与模型排行。支持按钮或 ⌘R 刷新，账户信息可悬停查看。
+
 - **OpenAI 账号池**：分别展示短周期和周额度、恢复时间、重置券；菜单栏显示两者中更少的剩余额度。周期名称来自实际窗口长度。
 - **Google Antigravity**：展示 Gemini / Claude 短周期和周额度。
 - **Cursor**：报告可用时展示第一方模型、API 用量或月度额度；无报告时明确提示不可用。
@@ -57,7 +59,8 @@
 
 ## 项目结构
 
-- `Sources/main.swift`：数据刷新、SwiftUI 界面、菜单栏生命周期。
+- `Sources/main.swift`：数据刷新、菜单栏生命周期。
+- `Sources/QuotaViews.swift`：额度卡片、用量排行和面板界面。
 - `Sources/QuotaCore.swift`：额度解析、增量用量统计、有限时命令执行。
 - `Tests/main.swift`：独立回归检查。
 - `OpenCodexMenuBar.bundle-template/Contents/Info.plist`：应用元数据；模板不携带旧可执行文件或签名。
