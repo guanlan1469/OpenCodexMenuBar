@@ -804,6 +804,7 @@ struct CursorQuotaCardView: View {
 
 struct PopoverContentView: View {
     @ObservedObject var dm: DataManager
+    private let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "未知"
 
     var body: some View {
         VStack(spacing: 0) {
@@ -826,7 +827,7 @@ struct PopoverContentView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("OpenCodex 全模型额度")
                         .font(.system(size: 13.5, weight: .bold))
-                    Text("OpenAI · Google · Cursor 三大通道概览")
+                    Text("v" + appVersion + " · OpenAI · Google · Cursor")
                         .font(.system(size: 9.5))
                         .foregroundColor(.secondary)
                 }
